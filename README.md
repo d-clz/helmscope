@@ -39,8 +39,9 @@ make build
 ./bin/helmscope ~/repos/platform-charts      # then open http://127.0.0.1:8088
 ```
 
-Or grab a prebuilt binary from Nexus:
-`$NEXUS_RAW_URL/helmscope/<tag>/helmscope-<os>-<arch>`.
+Or grab a prebuilt release from GitHub Releases or Nexus
+(`$NEXUS_RAW_URL/helmscope/<tag>/`): one archive each for Linux, macOS
+(universal: Intel and Apple Silicon) and Windows. See [Releases](#releases).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -112,6 +113,10 @@ web/core.js     pure logic: manifest split, fold, map/resources, topology, prove
 web/app.js      UI
 web/vendor/     js-yaml 4 (MIT), embedded
 testdata/       sample chart, fake helm/helmfile used by tests
+tools/lipo/     merges darwin amd64 + arm64 into one universal binary
+scripts/        winres (exe metadata), sign-windows, package, verify-windows.ps1
+build/windows/  exe manifest and icon
+ci/Dockerfile   builder image for the GitLab pipeline
 ```
 
 ## Test
@@ -120,6 +125,73 @@ testdata/       sample chart, fake helm/helmfile used by tests
 make test      # Go: vet + handler tests against fake helm/helmfile
 make test-ui   # Node: core.js logic
 ```
+
+## Releases
+
+`make release VERSION=v1.2.3` builds three portable archives in `dist/`, with
+no downloads (`GOPROXY=off`), and the output is reproducible:
+
+| Archive | Contents |
+|---|---|
+| `helmscope_<v>_linux_amd64.tar.gz` | static binary |
+| `helmscope_<v>_darwin_universal.tar.gz` | one binary for Intel and Apple Silicon, merged by `tools/lipo` (no Mac needed) |
+| `helmscope_<v>_windows_amd64.zip` | `helmscope.exe` with version info, manifest and icon; Authenticode-signed when a certificate is configured |
+| `SHA256SUMS` | hashes of the archives **and** the bare binaries |
+
+Build needs: Go, `zip`, `x86_64-w64-mingw32-windres` (`binutils-mingw-w64-x86-64`),
+and `osslsigncode` for signing. `ci/Dockerfile` bakes them into a builder image.
+
+CI runs the same make targets:
+- **GitHub** (`.github/workflows/release.yml`): test → build → verify on Linux,
+  macOS and Windows (Windows: version info, Authenticode status, a run, and a
+  Microsoft Defender scan) → on a `v*` tag, a GitHub release with build
+  provenance attestations.
+- **GitLab** (`.gitlab-ci.yml`): test → build → optional verify on your own
+  Windows runner → on a tag, upload to Nexus raw.
+
+### Getting `helmscope.exe` past corporate security tools
+
+Unsigned Go executables get flagged by AV/EDR heuristics fairly often. The build
+does what it can on its own; the rest needs your security team.
+
+What the build does:
+- **Version info, manifest and icon** (`scripts/winres.sh`): publisher,
+  description and version show in Properties, and the manifest declares
+  `asInvoker`, so it never asks for elevation. A bare exe with no metadata
+  scores worse.
+- **No packing or obfuscation**: no UPX or garble, both of which are classic
+  malware traits. The Windows binary also keeps its symbol table (no `-s -w`).
+- **Console app on loopback**: it listens on `127.0.0.1` by default, so no
+  firewall prompt, and it only starts the `helm`/`helmfile` you already have.
+- **Reproducible builds and hashes**: `SHA256SUMS` lists the exe's own hash,
+  and anyone can rebuild the tag and get the same bytes.
+- **Defender scan in CI**: `scripts/verify-windows.ps1` fails the build if
+  Defender flags the release.
+
+What actually gets it through, in order of effect:
+1. **Sign it** with a certificate your endpoints trust: your enterprise CA's
+   code-signing certificate, or a public one (EV or OV). Set:
+   - GitHub: secrets `WINDOWS_SIGN_PFX_BASE64` (`base64 -w0 cert.pfx`) and
+     `WINDOWS_SIGN_PFX_PASSWORD`; variable `WINDOWS_SIGN_TIMESTAMP_URL`
+   - GitLab: File variable `WINDOWS_SIGN_PFX_FILE`, plus
+     `WINDOWS_SIGN_PFX_PASSWORD` and `WINDOWS_SIGN_TIMESTAMP_URL` (use an
+     internal TSA behind the air gap)
+
+   Always timestamp, or the signature stops validating when the certificate
+   expires. Set `WIN_COMPANY` to the certificate's organisation so the
+   publisher and CompanyName match. Set `REQUIRE_WINDOWS_SIGNING=true` once
+   the certificate is in place, so a tag can't ship unsigned.
+2. **Allowlist** the signing certificate (better: it covers every future
+   release) or the exe's SHA-256 from `SHA256SUMS` in your EDR.
+3. **Test on a managed machine** before announcing a release: set
+   `WINDOWS_RUNNER_TAG` in GitLab to run `verify:windows` on a corporate
+   Windows runner, or run `scripts/verify-windows.ps1 -Zip <zip>` on a laptop.
+4. If Defender itself flags it, submit the file as a false positive at
+   https://www.microsoft.com/wdsi/filesubmission.
+
+macOS: the binary is ad-hoc signed by the Go linker but not notarized, so a
+browser download is quarantined. Run `xattr -d com.apple.quarantine helmscope`
+once, or download it with `curl`. Notarizing needs an Apple Developer account.
 
 ## Status
 
