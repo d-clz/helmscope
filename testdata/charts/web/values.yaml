@@ -1,0 +1,39 @@
+replicaCount: 2
+image:
+  repository: nexus.tpb.vn:5000/web
+  tag: "1.4.0"
+service:
+  port: 80
+ingress:
+  enabled: true
+  className: nginx
+  host: web.tpb.vn
+route:
+  enabled: true
+  host: admin.web.tpb.vn
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+migrate:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+metrics:
+  enabled: true
+cleanup:
+  schedule: "0 2 * * *"
+unusedKnob: true
+redis:
+  enabled: true

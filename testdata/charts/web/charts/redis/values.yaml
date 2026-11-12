@@ -1,0 +1,6 @@
+replicas: 3
+port: 6379
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi

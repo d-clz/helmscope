@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake helmfile for tests.
+set -euo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+[[ "${1:-}" == "--version" ]] && { echo "helmfile version 1.1.0-fake"; exit 0; }
+echo "args: $*" >&2
+out=""; cmd=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir) out="$2"; shift 2 ;;
+    --file|--environment|--selector|--args) shift 2 ;;
+    build|template|fetch) cmd="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$cmd" in
+  build) cat "$here/helmfile-build.yaml" ;;
+  template) echo "Templating release=web, chart=./charts/web" >&2; cat "$here/rendered.yaml" ;;
+  fetch) mkdir -p "$out/redis-shared/redis/18.1.0"; cp -r "$here/charts/web/charts/redis" "$out/redis-shared/redis/18.1.0/" ;;
+  *) echo "fake helmfile: unsupported" >&2; exit 2 ;;
+esac

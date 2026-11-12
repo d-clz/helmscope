@@ -1,0 +1,18 @@
+environments:
+  default: {}
+  uat:
+    values:
+      - env/uat.yaml
+  prod:
+    values:
+      - env/prod.yaml
+---
+releases:
+  - name: web
+    namespace: apps
+    chart: ./charts/web
+    needs: [platform/redis-shared]
+  - name: redis-shared
+    namespace: platform
+    chart: nexus/redis
+    version: 18.1.0

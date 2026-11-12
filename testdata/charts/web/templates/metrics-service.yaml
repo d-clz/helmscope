@@ -1,0 +1,13 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "web.fullname" . }}-metrics
+spec:
+  selector:
+    app.kubernetes.io/name: {{ .Chart.Name }}-metrics
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+{{- end }}

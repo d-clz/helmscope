@@ -1,0 +1,35 @@
+---
+#
+# Source: helmfile.yaml
+#
+filepath: helmfile.yaml
+environments:
+  uat:
+    values: []
+releases:
+- chart: ./charts/web
+  version: 0.3.1
+  name: web
+  namespace: apps
+  labels:
+    tier: frontend
+  needs:
+  - platform/redis-shared
+  values:
+  - replicaCount: 2
+    ingress:
+      host: web-uat.tpb.vn
+  - replicaCount: 3
+  set:
+  - name: image.tag
+    value: 1.4.1
+- chart: nexus/redis
+  version: 18.1.0
+  name: redis-shared
+  namespace: platform
+- chart: ./charts/web
+  name: worker
+  namespace: apps
+  installed: false
+  needs:
+  - queue

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake helm for tests: prints a canned render and echoes its args to stderr.
+set -euo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+case "${1:-}" in
+  version) echo "v3.17.0+gfake"; exit 0 ;;
+  template)
+    echo "args: $*" >&2
+    if [[ " $* " == *" fail=true "* ]]; then
+      echo 'Error: template: web/templates/deployment.yaml:8:20: executing "web/templates/deployment.yaml" at <.Values.replicaCount>: boom' >&2
+      exit 1
+    fi
+    cat "$here/rendered.yaml" ;;
+  *) echo "fake helm: unsupported $*" >&2; exit 2 ;;
+esac

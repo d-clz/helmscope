@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>helmscope</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%232f7de1' stroke-width='2'/%3E%3Cpath d='M8 2v12M2 8h12' stroke='%232f7de1' stroke-width='1.2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">helm<b>scope</b></div>
+  <div class="root" id="root" title="Scan root"></div>
+  <div class="tools" id="tools"></div>
+</header>
+<div class="shell">
+  <aside class="side">
+    <div class="seg" role="tablist">
+      <button data-action="mode" data-mode="chart" id="m-chart" class="on">Charts</button>
+      <button data-action="mode" data-mode="helmfile" id="m-helmfile">Helmfile</button>
+    </div>
+    <div id="side-body"></div>
+  </aside>
+  <main id="main"></main>
+</div>
+<script src="vendor/js-yaml.min.js"></script>
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
