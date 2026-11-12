@@ -1,27 +1,33 @@
-# Builds helmscope inside the air gap and publishes binaries to the Nexus raw
-# repository on tags. No Go modules are downloaded (GOPROXY=off).
+# Air-gapped twin of .github/workflows/release.yml: same make targets, no
+# downloads at build time (GOPROXY=off, tools baked into the builder image).
 #
 # Variables (Settings > CI/CD > Variables):
+#   BUILDER_IMAGE                image built from ci/Dockerfile
 #   NEXUS_USER, NEXUS_PASSWORD   masked
 #   NEXUS_RAW_URL                e.g. https://nexus.tpb.vn/repository/idp-raw
-#   INTERNAL_CA_FILE             file variable, optional: CA for Nexus TLS
-#   GO_IMAGE                     optional override of the build image
-#   NODE_IMAGE                   optional override of the UI test image
+#   INTERNAL_CA_FILE             File variable, optional: CA for Nexus TLS
+#   WINDOWS_SIGN_PFX_FILE        File variable, protected: code-signing .pfx
+#   WINDOWS_SIGN_PFX_PASSWORD    masked, protected
+#   WINDOWS_SIGN_TIMESTAMP_URL   internal RFC 3161 TSA, if you have one
+#   REQUIRE_WINDOWS_SIGNING      "true" to fail tag builds that would ship unsigned
+#   WIN_COMPANY                  CompanyName in the exe; match the cert's O=
+#   WINDOWS_RUNNER_TAG           tag of a corporate Windows runner, to scan the exe there
 
 variables:
-  GO_IMAGE: nexus.tpb.vn:5000/library/golang:1.24
+  BUILDER_IMAGE: nexus.tpb.vn:5000/platform/helmscope-builder:go1.24
   NODE_IMAGE: nexus.tpb.vn:5000/library/node:22-alpine
+  GIT_DEPTH: 0 # git describe needs tags
   GOPROXY: "off"
   CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath"
 
-stages: [test, build, publish]
+stages: [test, build, verify, publish]
 
 test:go:
   stage: test
-  image: $GO_IMAGE
+  image: $BUILDER_IMAGE
   script:
-    - go vet ./...
-    - go test ./...
+    - make test
 
 test:ui:
   stage: test
@@ -31,17 +37,46 @@ test:ui:
 
 build:
   stage: build
-  image: $GO_IMAGE
+  image: $BUILDER_IMAGE
+  variables:
+    REQUIRE_WINRES: "1"
   script:
-    - export VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-    - make dist VERSION="$VERSION"
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - export VERSION="${CI_COMMIT_TAG:-$(git describe --tags --always)}"
+    - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+    - make binaries VERSION="$VERSION"
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ] && [ "${REQUIRE_WINDOWS_SIGNING:-false}" = true ]; then export REQUIRE_SIGNING=1; fi
+      make sign
+    - make package VERSION="$VERSION"
+    - cat dist/SHA256SUMS
   artifacts:
-    paths: [dist/]
+    paths:
+      - dist/helmscope_*
+      - dist/SHA256SUMS
     expire_in: 2 weeks
+
+# Runs only if you have a Windows runner. On a corporate-managed machine the
+# endpoint agent sees the exe being extracted, run and scanned, which is the
+# closest you can get to "will security let this through" before release.
+verify:windows:
+  stage: verify
+  needs: [build]
+  tags: [$WINDOWS_RUNNER_TAG]
+  rules:
+    - if: $WINDOWS_RUNNER_TAG
+  script:
+    # -File can't take -Switch:$false, so the switch is added only when needed
+    - $zip = (Get-ChildItem dist/helmscope_*_windows_amd64.zip).FullName
+    - $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/verify-windows.ps1', '-Zip', $zip, '-SkipSignatureUpdate')
+    - if ($env:CI_COMMIT_TAG -and $env:REQUIRE_WINDOWS_SIGNING -eq 'true') { $a += '-RequireSigned' }
+    - powershell @a
+    - if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 publish:nexus:
   stage: publish
-  image: $GO_IMAGE
+  image: $BUILDER_IMAGE
+  needs: [build]
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -49,7 +84,7 @@ publish:nexus:
       set -eu
       CA=""
       if [ -n "${INTERNAL_CA_FILE:-}" ]; then CA="--cacert $INTERNAL_CA_FILE"; fi
-      for f in dist/*; do
+      for f in dist/helmscope_* dist/SHA256SUMS; do
         echo "uploading $f"
         curl -fsS $CA -u "$NEXUS_USER:$NEXUS_PASSWORD" --upload-file "$f" \
           "$NEXUS_RAW_URL/helmscope/$CI_COMMIT_TAG/$(basename "$f")"

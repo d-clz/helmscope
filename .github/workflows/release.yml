@@ -1,0 +1,157 @@
+# Builds the three portable releases on every push/PR, checks each one on its
+# own OS (Windows also gets a Microsoft Defender scan), and publishes a GitHub
+# release with build provenance when a v* tag is pushed.
+#
+# Optional repository settings (Settings > Secrets and variables > Actions):
+#   secrets.WINDOWS_SIGN_PFX_BASE64     code-signing .pfx, base64 -w0
+#   secrets.WINDOWS_SIGN_PFX_PASSWORD   its password
+#   vars.WINDOWS_SIGN_TIMESTAMP_URL     RFC 3161 TSA (default: DigiCert's public one)
+#   vars.REQUIRE_WINDOWS_SIGNING=true   fail tag builds that would ship unsigned
+#   vars.WIN_COMPANY                    CompanyName in the exe; match the cert's O=
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  GOPROXY: "off" # no module dependencies; nothing should be downloaded
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - run: make test
+      - run: make test-ui
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # git describe needs tags
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Install windres, osslsigncode, zip
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends binutils-mingw-w64-x86-64 osslsigncode zip
+      - name: Version
+        id: v
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="$GITHUB_REF_NAME"; else v="$(git describe --tags --always)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Build binaries
+        run: make binaries VERSION="${{ steps.v.outputs.version }}"
+        env:
+          REQUIRE_WINRES: "1"
+          WIN_COMPANY: ${{ vars.WIN_COMPANY }}
+      - name: Sign Windows binary
+        if: github.event_name != 'pull_request'
+        run: make sign
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+          REQUIRE_SIGNING: ${{ github.ref_type == 'tag' && vars.REQUIRE_WINDOWS_SIGNING == 'true' && '1' || '0' }}
+      - name: Package
+        run: make package VERSION="${{ steps.v.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helmscope-${{ steps.v.outputs.version }}
+          path: |
+            dist/helmscope_*
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux_amd64 }
+          - { os: macos-latest, platform: darwin_universal }
+          - { os: windows-latest, platform: windows_amd64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7 # for scripts/verify-windows.ps1
+      - uses: actions/download-artifact@v8
+        with:
+          name: helmscope-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          grep -E 'helmscope_.*\.(tar\.gz|zip)$' SHA256SUMS > archives.sha256
+          if command -v sha256sum >/dev/null; then sha256sum -c archives.sha256; else shasum -a 256 -c archives.sha256; fi
+      - name: Run (Linux / macOS)
+        if: runner.os != 'Windows'
+        working-directory: dist
+        run: |
+          tar xzf helmscope_*_${{ matrix.platform }}.tar.gz
+          bin="$(ls -d helmscope_*_${{ matrix.platform }})/helmscope"
+          "$bin" -version
+          if [ "$RUNNER_OS" = macOS ]; then
+            lipo -archs "$bin" | tee /dev/stderr | grep -q 'x86_64 arm64'
+            codesign -dv "$bin" 2>&1 | head -3 || true
+          fi
+          "$bin" -addr 127.0.0.1:18088 . & pid=$!
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18088/api/info && break; sleep 0.5; done
+          kill $pid
+      - name: Verify Windows exe (version info, signature, run, Defender scan)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem dist/helmscope_*_windows_amd64.zip).FullName
+          $strict = '${{ github.ref_type == 'tag' && vars.REQUIRE_WINDOWS_SIGNING == 'true' }}' -eq 'true'
+          ./scripts/verify-windows.ps1 -Zip $zip -RequireSigned:$strict
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: helmscope-${{ needs.build.outputs.version }}
+          path: dist
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/helmscope_*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/helmscope_* dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "helmscope $GITHUB_REF_NAME" --generate-notes $pre
