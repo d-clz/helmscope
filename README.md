@@ -8,10 +8,18 @@ Point it at a folder of charts or helmfiles and it shows:
   produced it.
 - **Source** for the template, with every `include`/`template` helper it uses
   (followed transitively) linked to its `define`.
-- **Map**: namespaces → workloads (Deployment, StatefulSet, DaemonSet, Job,
-  CronJob, …) with a replica badge and requests/limits per pod, × replicas,
-  at HPA max, and at the rollout peak. Also shows the ConfigMaps/Secrets/PVCs
-  each workload uses and checks any ResourceQuota in the render.
+- **Map**: every rendered manifest as a card, grouped by namespace, like
+  Headlamp's map: kind, name, a one-line summary (Service ports, Ingress hosts,
+  PVC size, HPA range…), a replica badge on workloads, and a status dot when
+  something needs a look. Filter by category or by status. Above the cards, a
+  **Resources** panel shows:
+  - per-workload QoS, pods, and requests/limits per pod and × replicas
+  - namespace totals at current replicas, HPA max, and the rollout peak, plus
+    PVC storage
+  - notes (missing requests/limits, BestEffort pods, init containers that set
+    the pod request, `spec.replicas` fighting an HPA)
+  - a suggested ResourceQuota (rollout peak + adjustable headroom) and, when
+    containers rely on defaults, a suggested LimitRange, ready to copy
 - **Topology**: how a request travels: host → Ingress/Route/HTTPRoute →
   Service port → container port. Broken references (named targetPort with no
   matching container port, backend port missing on the Service, Service that
@@ -82,6 +90,11 @@ The exact command line is shown in the toolbar and the Log tab.
   workload (min–max). DaemonSets multiply by the node count you set.
   Deployments add `maxSurge` (default 25%) for the rollout peak, which is the
   number a ResourceQuota has to allow.
+- **Quota suggestion** = rollout peak × (1 + headroom), rounded up. `limits.*`
+  is left out while any container lacks a limit, because that quota would make
+  the API reject those pods. If no LimitRange is rendered and containers lack
+  values, a LimitRange is suggested (largest limits and smallest requests
+  already in the namespace) and the quota is sized as if it were applied.
 - **Topology uses the rendered YAML only.** Service → workload comes from
   selector labels against pod template labels. Ports are resolved by name or
   number. Anything referenced but not rendered shows as a dashed node.

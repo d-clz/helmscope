@@ -77,7 +77,58 @@ t("buildMap: replicas, HPA, surge, totals", () => {
   assert.deepStrictEqual([ns.pods, ns.podsMax, ns.podsPeak], [6, 9, 11]);
   assert.strictEqual(HS.fmtCpu(ns.total.req.cpu), "850m");
   assert.strictEqual(HS.fmtCpu(ns.peak.req.cpu), "2100m");
-  assert.strictEqual(ns.others.Service, 3);
+  assert.strictEqual(ns.cards.length, 9, "every manifest gets a card");
+  assert.deepStrictEqual([...new Set(ns.cards.map((c) => c.category))], ["Workloads", "Network"]);
+  assert.strictEqual(ns.cards.find((c) => c.kind === "Service" && c.name === "demo-web").detail, "ClusterIP · 80→http");
+  assert.strictEqual(ns.cards.find((c) => c.kind === "HorizontalPodAutoscaler").detail, "2–5 → Deployment demo-web");
+  assert.strictEqual(web.qos, "Burstable");
+  assert.ok(web.notes.some((n) => /spec.replicas \(2\) is set while HPA/.test(n.msg)), "HPA vs spec.replicas");
+  assert.deepStrictEqual(ns.storage, { claims: 3, bytes: 3 * 8 * 2 ** 30 }, "StatefulSet claim templates × replicas");
+});
+
+t("suggestQuota with a suggested LimitRange", () => {
+  const { docs } = HS.splitManifest(rendered);
+  const ns = HS.buildMap(docs, "apps").namespaces[0];
+  assert.deepStrictEqual(ns.suggestedLimitRange.default, { cpu: "500m", memory: "512Mi" });
+  assert.deepStrictEqual(ns.withLimitRange.unbounded, [], "defaults bound every container");
+  const q = HS.suggestQuota(ns, 20);
+  assert.deepStrictEqual(q.hard, {
+    pods: "14", "requests.cpu": "3", "requests.memory": "5632Mi",
+    "limits.cpu": "10500m", "limits.memory": "8704Mi",
+    persistentvolumeclaims: "4", "requests.storage": "29Gi",
+  });
+  const out = HS.yaml.loadAll(q.yaml);
+  assert.deepStrictEqual(out.map((d) => d.kind), ["ResourceQuota", "LimitRange"]);
+  assert.strictEqual(out[0].metadata.namespace, "apps");
+});
+
+t("suggestQuota leaves limits out when containers are unbounded and a LimitRange exists", () => {
+  const { docs } = HS.splitManifest(`---
+# Source: x/templates/a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: a, namespace: ops}
+spec:
+  replicas: 4
+  strategy: {type: Recreate}
+  template:
+    spec:
+      containers:
+        - name: a
+          resources: {requests: {cpu: 250m, memory: 256Mi}}
+---
+# Source: x/templates/b.yaml
+apiVersion: v1
+kind: LimitRange
+metadata: {name: lr, namespace: ops}
+spec:
+  limits: [{type: Container, defaultRequest: {cpu: 10m}}]
+`);
+  const ns = HS.buildMap(docs, "default").namespaces.find((n) => n.name === "ops");
+  assert.ok(!ns.suggestedLimitRange, "a rendered LimitRange exists, so none is suggested");
+  const q = HS.suggestQuota(ns, 0);
+  assert.deepStrictEqual(q.hard, { pods: "4", "requests.cpu": "1", "requests.memory": "1Gi" });
+  assert.ok(q.notes.some((n) => /limits.cpu left out/.test(n.msg)));
 });
 
 t("buildMap: DaemonSet nodes, LimitRange, ResourceQuota", () => {
