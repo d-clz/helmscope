@@ -294,10 +294,78 @@
     return h && { name: h.name, min: get(h.obj, ["spec", "minReplicas"]) ?? 1, max: get(h.obj, ["spec", "maxReplicas"]) ?? 1 };
   }
 
-  // ---- map: namespaces → workloads → resources ---------------------------------
+  // ---- map: every manifest as a card, grouped by namespace ------------------------
+
+  const CATEGORIES = ["Workloads", "Network", "Storage", "Configuration", "Security", "Other"];
+  const CAT = {};
+  [
+    ["Workloads", [...WORKLOADS, "HorizontalPodAutoscaler", "PodDisruptionBudget", "VerticalPodAutoscaler"]],
+    ["Network", ["Service", "Ingress", "Route", "HTTPRoute", "GRPCRoute", "Gateway", "NetworkPolicy", "Endpoints", "EndpointSlice", "IngressClass"]],
+    ["Storage", ["PersistentVolumeClaim", "PersistentVolume", "StorageClass", "VolumeSnapshot"]],
+    ["Configuration", ["ConfigMap", "Secret", "SealedSecret", "ExternalSecret", "LimitRange", "ResourceQuota", "PriorityClass"]],
+    ["Security", ["ServiceAccount", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding", "SecurityContextConstraints"]],
+  ].forEach(([c, ks]) => ks.forEach((k) => (CAT[k] = c)));
+  const categoryOf = (kind) => CAT[kind] || "Other";
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const WORKLOAD_ORDER = ["Deployment", "DeploymentConfig", "Rollout", "StatefulSet", "DaemonSet", "ReplicaSet", "Pod", "Job", "CronJob", "HorizontalPodAutoscaler", "PodDisruptionBudget"];
+
+  // describe is the one-line summary under a card's name.
+  function describe(d) {
+    const o = d.obj || {};
+    const s = o.spec || {};
+    const n = (x) => Object.keys(x || {}).length;
+    switch (d.kind) {
+      case "Service": return [s.type || "ClusterIP", (s.ports || []).filter(Boolean).map((p) => `${p.port}→${p.targetPort ?? p.port}`).join(", ")].filter(Boolean).join(" · ");
+      case "Ingress": return (s.rules || []).filter(Boolean).map((r) => r.host || "*").join(", ") || "default backend";
+      case "Route": return (s.host || "router-generated host") + (s.path || "");
+      case "HTTPRoute": case "GRPCRoute": return (s.hostnames || []).join(", ") || "any host";
+      case "ConfigMap": return plural(n(o.data) + n(o.binaryData), "key");
+      case "Secret": return `${o.type || "Opaque"} · ${plural(n(o.data) + n(o.stringData), "key")}`;
+      case "PersistentVolumeClaim": return [get(s, ["resources", "requests", "storage"]), (s.accessModes || []).join(","), s.storageClassName].filter(Boolean).join(" · ");
+      case "HorizontalPodAutoscaler": { const t = s.scaleTargetRef || {}; return `${s.minReplicas ?? 1}–${s.maxReplicas ?? "?"} → ${t.kind || "?"} ${t.name || ""}`; }
+      case "PodDisruptionBudget": return s.minAvailable != null ? `minAvailable ${s.minAvailable}` : s.maxUnavailable != null ? `maxUnavailable ${s.maxUnavailable}` : "";
+      case "NetworkPolicy": return (s.policyTypes || ["Ingress"]).join(", ");
+      case "Role": case "ClusterRole": return plural((o.rules || []).length, "rule");
+      case "RoleBinding": case "ClusterRoleBinding": return `${(o.roleRef || {}).name || "?"} → ${plural((o.subjects || []).length, "subject")}`;
+      case "ResourceQuota": return plural(n(s.hard), "limit");
+      case "LimitRange": return plural((s.limits || []).length, "rule");
+      case "CustomResourceDefinition": return s.group || "";
+      case "ServiceAccount": return o.automountServiceAccountToken === false ? "token automount off" : "";
+    }
+    const ps = podSpecOf(d);
+    if (ps) {
+      const cs = (ps.spec.containers || []).filter(Boolean);
+      const img = cs[0] && cs[0].image ? String(cs[0].image).split("/").pop() : "";
+      return img + (cs.length > 1 ? ` +${cs.length - 1}` : "");
+    }
+    return d.apiVersion;
+  }
+
+  function qosOf(pod) {
+    const cs = pod.containers;
+    if (!cs.length || cs.every((c) => !Object.keys(c.req).length && !Object.keys(c.lim).length)) return "BestEffort";
+    return cs.every((c) => CORE.every((k) => c.lim[k] != null && c.req[k] === c.lim[k])) ? "Guaranteed" : "Burstable";
+  }
+
+  function workloadNotes(d, w) {
+    const out = [];
+    const s = d.obj.spec || {};
+    w.pod.missing.forEach((m) => {
+      const req = m.gaps.filter((g) => g.startsWith("requests.")).map((g) => g.slice(9));
+      const lim = m.gaps.filter((g) => g.startsWith("limits.")).map((g) => g.slice(7));
+      const who = `${m.container}${m.type !== "app" ? ` (${m.type})` : ""}`;
+      if (req.length) out.push({ sev: "warn", msg: `${who}: no ${req.join("/")} request, so the scheduler reserves nothing for it` });
+      if (lim.length) out.push({ sev: "warn", msg: `${who}: no ${lim.join("/")} limit, so the pod can use more than the totals show, and a limits.* quota will reject it` });
+    });
+    if (w.qos === "BestEffort") out.push({ sev: "warn", msg: "BestEffort QoS: evicted first under node pressure" });
+    w.pod.initDominates.forEach((k) => out.push({ sev: "info", msg: `An init container sets the pod's ${k} request; it's larger than the app containers' total` }));
+    if (w.replicas.hpa && s.replicas != null) out.push({ sev: "warn", msg: `spec.replicas (${s.replicas}) is set while HPA ${w.replicas.hpa} manages scaling, so every helm upgrade resets it to ${s.replicas}. Drop spec.replicas when autoscaling is on.` });
+    if (w.pod.fromLR.length) out.push({ sev: "info", msg: `${w.pod.fromLR.join(", ")} come from the namespace LimitRange` });
+    return out;
+  }
 
   function buildMap(docs, defaultNs, opts) {
-    opts = Object.assign({ nodes: 1 }, opts || {});
+    opts = Object.assign({ nodes: 1, limitRanges: {} }, opts || {});
     const objs = docs.filter((d) => d.obj && d.name);
     const nsOf = (d) => nsOfDoc(d, defaultNs);
     const hpas = objs.filter((d) => d.kind === "HorizontalPodAutoscaler");
@@ -305,24 +373,36 @@
     const lrByNs = {};
     objs.filter((d) => d.kind === "LimitRange").forEach((d) => {
       const c = (get(d.obj, ["spec", "limits"]) || []).find((l) => l && l.type === "Container");
-      if (c) lrByNs[nsOf(d)] = Object.assign({ name: d.name }, c);
+      if (c) lrByNs[nsOf(d)] = Object.assign({ name: d.name, rendered: true }, c);
     });
+    Object.keys(opts.limitRanges).forEach((ns) => { if (!lrByNs[ns]) lrByNs[ns] = opts.limitRanges[ns]; });
 
     const spaces = new Map();
     const space = (ns) => {
-      if (!spaces.has(ns)) spaces.set(ns, { name: ns, workloads: [], others: {}, pods: 0, podsMax: 0, podsPeak: 0, total: zeroRes(), max: zeroRes(), peak: zeroRes(), quotas: [], limitRange: lrByNs[ns] ? lrByNs[ns].name : "" });
+      if (!spaces.has(ns)) {
+        spaces.set(ns, {
+          name: ns, cards: [], workloads: [], pods: 0, podsMax: 0, podsPeak: 0,
+          total: zeroRes(), max: zeroRes(), peak: zeroRes(), quotas: [],
+          storage: { claims: 0, bytes: 0 }, unbounded: [],
+          limitRange: lrByNs[ns] && lrByNs[ns].rendered ? lrByNs[ns].name : "",
+        });
+      }
       return spaces.get(ns);
     };
-    const all = { pods: 0, podsMax: 0, podsPeak: 0, total: zeroRes(), max: zeroRes(), peak: zeroRes(), workloads: 0 };
+    const all = { pods: 0, podsMax: 0, podsPeak: 0, total: zeroRes(), max: zeroRes(), peak: zeroRes(), workloads: 0, manifests: 0 };
 
     objs.forEach((d) => {
       const ns = nsOf(d);
       const sp = space(ns);
-      const ps = WORKLOADS.has(d.kind) ? podSpecOf(d) : null;
-      if (!ps) {
-        sp.others[d.kind] = (sp.others[d.kind] || 0) + 1;
-        return;
+      const card = { doc: d.index, kind: d.kind, name: d.name, category: categoryOf(d.kind), detail: describe(d), hook: d.hook, workload: null };
+      sp.cards.push(card);
+      all.manifests++;
+      if (d.kind === "PersistentVolumeClaim") {
+        sp.storage.claims++;
+        sp.storage.bytes += parseQty(get(d.obj, ["spec", "resources", "requests", "storage"])) || 0;
       }
+      const ps = WORKLOADS.has(d.kind) ? podSpecOf(d) : null;
+      if (!ps) return;
       const rep = replicasOf(d, hpaFor(d, hpas, ns, defaultNs), opts);
       const hi = rep.max ?? rep.n;
       const surge = surgeOf(d, hi);
@@ -331,7 +411,11 @@
       if (d.kind === "StatefulSet") {
         (get(d.obj, ["spec", "volumeClaimTemplates"]) || []).forEach((t) => {
           const nm = t && t.metadata && t.metadata.name;
-          if (nm) refs.push({ kind: "PersistentVolumeClaim", name: `${nm}-${d.name}-*`, how: "claim template " + (get(t, ["spec", "resources", "requests", "storage"]) || ""), doc: d.index, generated: true });
+          if (!nm) return;
+          const size = get(t, ["spec", "resources", "requests", "storage"]);
+          refs.push({ kind: "PersistentVolumeClaim", name: `${nm}-${d.name}-*`, how: "claim template " + (size || ""), doc: d.index, generated: true });
+          sp.storage.claims += hi;
+          sp.storage.bytes += (parseQty(size) || 0) * hi;
         });
       }
       const w = {
@@ -340,7 +424,11 @@
         max: addRes(zeroRes(), pod, hi),
         peak: addRes(zeroRes(), pod, hi + surge),
       };
+      w.qos = qosOf(pod);
+      w.notes = workloadNotes(d, w);
+      card.workload = w;
       sp.workloads.push(w);
+      pod.unbounded.forEach((k) => !sp.unbounded.includes(k) && sp.unbounded.push(k));
       [sp, all].forEach((t) => {
         t.pods += rep.n; t.podsMax += hi; t.podsPeak += hi + surge;
         addRes(t.total, pod, rep.n); addRes(t.max, pod, hi); addRes(t.peak, pod, hi + surge);
@@ -354,20 +442,101 @@
       Object.keys(hard).forEach((k) => {
         let used = null;
         const m = k.match(/^(requests|limits)\.(.+)$/);
-        if (m) used = sp.peak[m[1] === "requests" ? "req" : "lim"][m[2]] || 0;
+        if (k === "requests.storage") used = sp.storage.bytes;
+        else if (m) used = sp.peak[m[1] === "requests" ? "req" : "lim"][m[2]] || 0;
         else if (CORE.includes(k)) used = sp.peak.req[k] || 0;
         else if (k === "pods") used = sp.podsPeak;
+        else if (k === "persistentvolumeclaims") used = sp.storage.claims;
         if (used === null) return;
-        const res = m ? m[2] : k;
-        const h = k === "pods" ? +hard[k] : parseQty(hard[k]);
-        sp.quotas.push({ quota: d.name, key: k, res, hard: h, used, over: used > h });
+        const res = k === "requests.storage" ? "memory" : m ? m[2] : k;
+        const count = k === "pods" || k === "persistentvolumeclaims";
+        const h = count ? +hard[k] : parseQty(hard[k]);
+        sp.quotas.push({ quota: d.name, key: k, res, count, hard: h, used, over: used > h });
       });
     });
 
     const list = [...spaces.values()].sort((a, b) => (a.name === "") - (b.name === "") || a.name.localeCompare(b.name));
-    const ORDER = ["Deployment", "DeploymentConfig", "Rollout", "StatefulSet", "DaemonSet", "ReplicaSet", "Pod", "Job", "CronJob"];
-    list.forEach((s) => s.workloads.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.name.localeCompare(b.name)));
+    const wo = (k) => { const i = WORKLOAD_ORDER.indexOf(k); return i < 0 ? 99 : i; };
+    list.forEach((s) => {
+      s.workloads.sort((a, b) => wo(a.kind) - wo(b.kind) || a.name.localeCompare(b.name));
+      s.cards.sort((a, b) => CATEGORIES.indexOf(a.category) - CATEGORIES.indexOf(b.category) || wo(a.kind) - wo(b.kind) || a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+    });
+
+    // Where containers lack requests/limits and no LimitRange is rendered,
+    // suggest one and size the quota as if it were applied.
+    if (!opts.inner) {
+      const suggested = {};
+      list.forEach((s) => {
+        if (s.limitRange || !s.workloads.some((w) => w.pod.missing.length)) return;
+        suggested[s.name] = suggestLimitRange(s);
+      });
+      if (Object.keys(suggested).length) {
+        const inner = buildMap(docs, defaultNs, Object.assign({}, opts, { inner: true, limitRanges: suggested }));
+        list.forEach((s) => {
+          if (!suggested[s.name]) return;
+          s.suggestedLimitRange = suggested[s.name];
+          s.withLimitRange = inner.namespaces.find((x) => x.name === s.name);
+        });
+      }
+    }
     return { namespaces: list, all };
+  }
+
+  // ---- quota / LimitRange suggestions -------------------------------------------
+
+  const roundUp = (v, step) => Math.ceil(v / step - 1e-9) * step;
+  const quotaCpu = (c) => (c <= 2 ? roundUp(c, 0.1) : roundUp(c, 0.5));
+  const quotaMem = (b) => (b <= 2 * 2 ** 30 ? roundUp(b, 128 * 2 ** 20) : roundUp(b, 512 * 2 ** 20));
+  const qtyCpu = (c) => { const m = Math.round(c * 1000); return m % 1000 === 0 ? String(m / 1000) : `${m}m`; };
+  const qtyMem = (b) => (b % 2 ** 30 === 0 ? `${b / 2 ** 30}Gi` : `${Math.ceil(b / 2 ** 20)}Mi`);
+
+  // suggestLimitRange takes the largest limits and smallest requests already
+  // set in the namespace, so defaulted containers look like their neighbours.
+  function suggestLimitRange(sp) {
+    const seen = { req: { cpu: [], memory: [] }, lim: { cpu: [], memory: [] } };
+    sp.workloads.forEach((w) => w.pod.containers.forEach((c) => CORE.forEach((k) => {
+      if (c.lim[k] != null && !c.src["limits." + k]) seen.lim[k].push(c.lim[k]);
+      if (c.req[k] != null && !c.src["requests." + k]) seen.req[k].push(c.req[k]);
+    })));
+    const lim = { cpu: seen.lim.cpu.length ? Math.max(...seen.lim.cpu) : 0.5, memory: seen.lim.memory.length ? Math.max(...seen.lim.memory) : 512 * 2 ** 20 };
+    const req = {
+      cpu: Math.min(seen.req.cpu.length ? Math.min(...seen.req.cpu) : 0.1, lim.cpu),
+      memory: Math.min(seen.req.memory.length ? Math.min(...seen.req.memory) : 128 * 2 ** 20, lim.memory),
+    };
+    return {
+      name: "default-container-resources",
+      default: { cpu: qtyCpu(lim.cpu), memory: qtyMem(lim.memory) },
+      defaultRequest: { cpu: qtyCpu(req.cpu), memory: qtyMem(req.memory) },
+    };
+  }
+
+  // suggestQuota sizes a ResourceQuota from the rollout peak plus headroom.
+  function suggestQuota(sp, headroomPct) {
+    const basis = sp.withLimitRange || sp;
+    const h = 1 + (headroomPct || 0) / 100;
+    const hard = {};
+    const notes = [];
+    if (basis.podsPeak) hard.pods = String(Math.ceil(basis.podsPeak * h));
+    if (basis.peak.req.cpu) hard["requests.cpu"] = qtyCpu(quotaCpu(basis.peak.req.cpu * h));
+    if (basis.peak.req.memory) hard["requests.memory"] = qtyMem(quotaMem(basis.peak.req.memory * h));
+    CORE.forEach((k) => {
+      if (basis.unbounded.includes(k)) notes.push({ sev: "warn", msg: `limits.${k} left out: some containers have no ${k} limit, and a limits.${k} quota would make the API reject their pods` });
+      else if (basis.peak.lim[k]) hard["limits." + k] = k === "cpu" ? qtyCpu(quotaCpu(basis.peak.lim.cpu * h)) : qtyMem(quotaMem(basis.peak.lim.memory * h));
+    });
+    if (basis.storage.claims) {
+      hard.persistentvolumeclaims = String(Math.ceil(basis.storage.claims * h));
+      if (basis.storage.bytes) hard["requests.storage"] = qtyMem(roundUp(basis.storage.bytes * h, 2 ** 30));
+    }
+    if (sp.withLimitRange) notes.push({ sev: "info", msg: "Sized as if the suggested LimitRange is applied, since some containers rely on its defaults" });
+    notes.push({ sev: "info", msg: `Based on the rollout peak (${basis.podsPeak} pods) plus ${headroomPct || 0}% headroom. Rounded up to 100m/500m CPU and 128Mi/512Mi memory steps.` });
+    const quota = { apiVersion: "v1", kind: "ResourceQuota", metadata: { name: "compute-quota", namespace: sp.name }, spec: { hard } };
+    const docsOut = [quota];
+    if (sp.suggestedLimitRange) {
+      const lr = sp.suggestedLimitRange;
+      docsOut.push({ apiVersion: "v1", kind: "LimitRange", metadata: { name: lr.name, namespace: sp.name }, spec: { limits: [{ type: "Container", default: lr.default, defaultRequest: lr.defaultRequest }] } });
+    }
+    const yaml = docsOut.map((d) => jsyaml.dump(d, { lineWidth: -1, noRefs: true, quotingType: '"' })).join("---\n");
+    return { hard, notes, yaml };
   }
 
   // ---- topology: entry → router → service → pods ---------------------------------
@@ -908,6 +1077,7 @@
   return {
     splitManifest, fold, dump, podSpecOf,
     parseQty, fmtCpu, fmtBytes, fmtRes, podRes, buildMap, buildTopology,
+    suggestQuota, describe, categoryOf, CATEGORIES,
     flatten, coalesce, provenance, parseSet, setPath, valueRefs, isReferenced, pathKey,
     parseErrors, defines, includes, helpersClosure, mapLine,
     parseHelmfileState, releaseLayers, needsLayers,

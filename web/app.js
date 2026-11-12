@@ -24,6 +24,10 @@
     layers: [],
     tab: "manifests",
     dsNodes: store.get("dsNodes", 3),
+    headroom: store.get("headroom", 20),
+    hideCats: store.get("hideCats", []),
+    issuesOnly: false,
+    quotaYaml: {},
     fold: store.get("fold", true),
     docFilter: "",
     valFilter: "", onlyOverridden: false, onlyUnref: false,
@@ -209,7 +213,7 @@
   function tabBody(rows, topo) {
     switch (S.tab) {
       case "manifests": return manifestsHTML();
-      case "map": return mapHTML();
+      case "map": return mapHTML(topo);
       case "topology": return topologyHTML(topo);
       case "values": return valuesHTML(rows);
       case "output": return `<pre class="code" style="padding:10px">${esc(S.res ? S.res.stdout : "")}</pre>`;
@@ -266,92 +270,138 @@
     return out;
   }
 
-  // ---- map: namespaces → workloads → resources ---------------------------------
+  // ---- map: every manifest as a card; resources summarised above ------------------
 
-  const KIND_ABBR = { Deployment: "Deploy", StatefulSet: "STS", DaemonSet: "DS", ReplicaSet: "RS", Job: "Job", CronJob: "CJ", Pod: "Pod", DeploymentConfig: "DC", Rollout: "Ro" };
-  const REF_ABBR = { ConfigMap: "cm", Secret: "secret", PersistentVolumeClaim: "pvc", ServiceAccount: "sa" };
+  const KIND_ABBR = {
+    Deployment: "Deploy", StatefulSet: "STS", DaemonSet: "DS", ReplicaSet: "RS", Job: "Job", CronJob: "CJ", Pod: "Pod", DeploymentConfig: "DC", Rollout: "Ro",
+    Service: "Svc", Ingress: "Ing", Route: "Route", HTTPRoute: "HTTP", GRPCRoute: "gRPC", NetworkPolicy: "NetP", ConfigMap: "CM", Secret: "Sec",
+    PersistentVolumeClaim: "PVC", HorizontalPodAutoscaler: "HPA", PodDisruptionBudget: "PDB", ServiceAccount: "SA", Role: "Role", RoleBinding: "RB",
+    ClusterRole: "CR", ClusterRoleBinding: "CRB", ResourceQuota: "RQ", LimitRange: "LR", CustomResourceDefinition: "CRD",
+  };
+  const abbr = (k) => KIND_ABBR[k] || (k.match(/[A-Z]/g) || [k[0]]).join("").slice(0, 4);
   const currentNs = () => (S.mode === "chart" ? S.form.namespace : S.release.namespace) || "default";
   const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const RANK = { error: 3, warn: 2, info: 1 };
 
   function resCell(m, k, unbounded) {
     const req = HS.fmtRes(k, m.req[k]);
     const lim = m.lim[k] == null ? "—" : HS.fmtRes(k, m.lim[k]) + (unbounded ? "+" : "");
     const limCls = m.lim[k] == null || unbounded ? "warnc" : "";
-    return `<td><span class="${m.req[k] == null ? "warnc" : ""}">${esc(req)}</span><span class="muted"> / </span><span class="${limCls}" title="${unbounded ? "At least one container has no limit, so the pod can use more than this" : ""}">${esc(lim)}</span></td>`;
+    return `<td><span class="${m.req[k] == null ? "warnc" : ""}">${esc(req)}</span><span class="muted"> / </span><span class="${limCls}" title="${unbounded ? "At least one container has no limit, so the real ceiling is higher" : ""}">${esc(lim)}</span></td>`;
   }
 
-  function resTable(rows, keys) {
-    return `<table class="rt"><thead><tr><th></th>${keys.map((k) => `<th>${esc(k === "cpu" ? "CPU" : k === "memory" ? "Memory" : k)} <span class="muted">req / lim</span></th>`).join("")}</tr></thead>
-      <tbody>${rows.map((r) => `<tr class="${r.cls || ""}"><td title="${esc(r.tip || "")}">${esc(r.label)}</td>${keys.map((k) => resCell(r.res, k, (r.unbounded || []).includes(k))).join("")}</tr>`).join("")}</tbody></table>`;
+  const resHead = (keys) => keys.map((k) => `<th>${esc(k === "cpu" ? "CPU" : k === "memory" ? "Memory" : k)} <span class="muted">req / lim</span></th>`).join("");
+
+  function totalsRows(t, unb, keys) {
+    const rows = [[plural(t.pods, "pod"), t.total, ""]];
+    if (t.podsMax !== t.pods) rows.push([`${t.podsMax} at HPA max`, t.max, ""]);
+    if (t.podsPeak !== t.podsMax) rows.push([`${t.podsPeak} at rollout peak`, t.peak, "HPA max plus maxSurge pods during a rolling update: what a ResourceQuota has to allow"]);
+    return rows.map(([label, res, tip]) => `<tr class="tot"><td title="${esc(tip)}">${esc(label)}</td>${keys.map((k) => resCell(res, k, unb.includes(k))).join("")}</tr>`).join("");
   }
 
-  function badge(rep) {
-    if (rep.perNode) return `<span class="badge" title="${esc(rep.note)}">${rep.n}<small>/node</small></span>`;
-    if (rep.max != null) return `<span class="badge wide" title="${esc(rep.note)}">${rep.n}–${rep.max}</span>`;
-    return `<span class="badge" title="${esc(rep.note)}">${rep.n}</span>`;
-  }
-
-  function workloadCard(w, keys) {
+  function podsLabel(w) {
     const r = w.replicas;
-    const hi = r.max ?? r.n;
-    const rows = [{ label: "per pod", res: w.pod, unbounded: w.pod.unbounded }];
-    if (r.n !== 1 || r.max != null) rows.push({ label: `× ${r.n}${r.perNode ? " nodes" : ""}`, res: w.total, unbounded: w.pod.unbounded });
-    if (r.max != null) rows.push({ label: `× ${r.max} HPA max`, res: w.max, unbounded: w.pod.unbounded });
-    if (w.surge) rows.push({ label: `× ${hi + w.surge} rollout`, res: w.peak, unbounded: w.pod.unbounded, cls: "muted-row", tip: `maxSurge adds ${w.surge} pod${w.surge === 1 ? "" : "s"} during a rolling update` });
-    const notes = [];
-    w.pod.missing.forEach((m) => notes.push(`<div class="warn-line">${esc(m.container)}${m.type !== "app" ? ` (${m.type})` : ""}: no ${esc(m.gaps.join(", "))}</div>`));
-    w.pod.initDominates.forEach((k) => notes.push(`<div class="info-line">An init container sets the pod's ${esc(k)} request (it's larger than the app containers' total)</div>`));
-    if (w.pod.fromLR.length) notes.push(`<div class="info-line">${esc(w.pod.fromLR.join(", "))} filled in from the namespace LimitRange</div>`);
-    const ctr = w.pod.containers;
-    return `<div class="wl" data-action="jump-doc" data-doc="${w.doc}">
-      <div class="wl-h"><span class="kic k-${esc(w.kind)}">${esc(KIND_ABBR[w.kind] || w.kind)}</span>
-        <div class="wl-t"><div class="muted">${esc(w.kind)}</div><div class="wl-name" title="${esc(w.name)}">${esc(w.name)}</div></div>${badge(r)}</div>
-      ${r.note ? `<div class="wl-note">${esc(r.note)}</div>` : ""}
-      ${resTable(rows, keys)}
-      ${notes.join("")}
-      <details class="ctr"><summary>${plural(ctr.length, "container")}</summary>
-        <table class="rt"><tbody>${ctr.map((c) => `<tr><td><b>${esc(c.name)}</b>${c.type !== "app" ? ` <span class="tag">${c.type}</span>` : ""}<div class="muted mono img" title="${esc(c.image)}">${esc(c.image)}</div></td>${keys.map((k) => resCell(c, k, false)).join("")}</tr>`).join("")}</tbody></table>
-      </details>
-      ${w.refs.length ? `<div class="chips">${w.refs.map((x) => `<span class="chip ${x.doc < 0 ? "ghost" : ""}" ${x.doc >= 0 && !x.generated ? `data-action="jump-doc" data-doc="${x.doc}"` : ""} title="${esc(x.kind + " " + x.name + " · " + x.how + (x.doc < 0 ? " · not in this render" : ""))}">${esc(REF_ABBR[x.kind] || x.kind)}/${esc(x.name)}</span>`).join("")}</div>` : ""}
+    let s = r.perNode ? `${r.n} (1/node)` : r.max != null ? `${r.n}–${r.max}` : String(r.n);
+    if (w.surge) s += ` <span class="muted">+${w.surge} surge</span>`;
+    return `<span title="${esc(r.note || "")}">${s}</span>`;
+  }
+
+  function resourcesPanel(m, keys) {
+    const spaces = m.namespaces.filter((ns) => ns.workloads.length);
+    if (!spaces.length) return "";
+    const a = m.all;
+    const unbAll = keys.filter((k) => spaces.some((ns) => ns.unbounded.includes(k)));
+    let html = `<details class="res-panel" ${store.get("resOpen", true) ? "open" : ""} id="res-panel">
+      <summary><b>Resources</b> <span class="muted">${plural(a.workloads, "workload")} · ${plural(a.pods, "pod")}${a.podsPeak !== a.pods ? ` (${a.podsPeak} at peak)` : ""} · requests ${esc(HS.fmtCpu(a.total.req.cpu))} CPU, ${esc(HS.fmtBytes(a.total.req.memory))} memory</span></summary>
+      <div class="res-body">`;
+    if (spaces.length > 1) {
+      html += `<table class="rt res-all"><thead><tr><th>All namespaces</th>${resHead(keys)}</tr></thead><tbody>${totalsRows(a, unbAll, keys)}</tbody></table>`;
+    }
+    spaces.forEach((ns) => {
+      const notes = ns.workloads.flatMap((w) => w.notes.map((n) => Object.assign({ w }, n))).sort((x, y) => RANK[y.sev] - RANK[x.sev]);
+      const q = HS.suggestQuota(ns, S.headroom);
+      S.quotaYaml[ns.name] = q.yaml;
+      html += `<section class="res-ns">
+        <h4><span class="muted">Namespace</span> ${esc(ns.name || "cluster-scoped")}${ns.limitRange ? ` <span class="tag">LimitRange ${esc(ns.limitRange)}</span>` : ""}</h4>
+        <div class="tbl-scroll"><table class="rt res-tbl"><thead><tr><th>Workload</th><th>QoS</th><th>Pods</th><th class="grp" colspan="${keys.length}">Per pod</th><th class="grp" colspan="${keys.length}">× replicas</th></tr>
+          <tr><th></th><th></th><th></th>${resHead(keys)}${resHead(keys)}</tr></thead><tbody>
+          ${ns.workloads.map((w) => `<tr data-action="jump-doc" data-doc="${w.doc}" class="wrow">
+            <td>${esc(w.name)}<span class="kindt">${esc(w.kind)}</span>${w.notes.some((n) => n.sev !== "info") ? ' <span class="dot warn" title="see notes below">!</span>' : ""}</td>
+            <td><span class="qos q-${w.qos}">${w.qos}</span></td><td>${podsLabel(w)}</td>
+            ${keys.map((k) => resCell(w.pod, k, w.pod.unbounded.includes(k))).join("")}
+            ${keys.map((k) => resCell(w.total, k, w.pod.unbounded.includes(k))).join("")}</tr>`).join("")}
+          </tbody></table></div>
+        <table class="rt res-tot"><thead><tr><th>Namespace total</th>${resHead(keys)}</tr></thead><tbody>${totalsRows(ns, ns.unbounded, keys)}
+          ${ns.storage.claims ? `<tr class="tot"><td>${plural(ns.storage.claims, "PVC")}</td><td colspan="${keys.length}">${esc(HS.fmtBytes(ns.storage.bytes))} storage requested${ns.workloads.some((w) => w.kind === "StatefulSet") ? " <span class=\"muted\">(StatefulSet claims × replicas)</span>" : ""}</td></tr>` : ""}</tbody></table>
+        ${notes.length ? `<div class="notes"><div class="sub">Notes</div>${notes.map((n) => `<div class="note ${n.sev}" data-action="jump-doc" data-doc="${n.w.doc}"><b>${esc(n.w.name)}</b> ${esc(n.msg)}</div>`).join("")}</div>` : ""}
+        ${ns.quotas.length ? `<div class="sub">Rendered ResourceQuota vs rollout peak</div><div class="quotas">${ns.quotas.map((qq) => {
+          const pct = qq.hard ? Math.min(100, (qq.used / qq.hard) * 100) : 100;
+          const f = (v) => (qq.count ? String(v) : HS.fmtRes(qq.res, v));
+          return `<div class="q ${qq.over ? "over" : ""}" title="ResourceQuota ${esc(qq.quota)}"><span class="mono">${esc(qq.key)}</span><span class="bar"><i style="width:${pct}%"></i></span><span class="mono">${esc(f(qq.used))} / ${esc(f(qq.hard))}</span></div>`;
+        }).join("")}</div>` : ""}
+        <div class="suggest">
+          <div class="sub">Suggested ResourceQuota${ns.suggestedLimitRange ? " + LimitRange" : ""}
+            <label class="ctl">headroom <input class="headroom" id="headroom" type="number" min="0" max="300" step="5" value="${S.headroom}" style="width:62px">%</label>
+            <button class="btn sm" data-action="copy-quota" data-ns="${esc(ns.name)}">Copy YAML</button></div>
+          ${q.notes.map((n) => `<div class="note ${n.sev}">${esc(n.msg)}</div>`).join("")}
+          <pre class="code yaml-out">${esc(q.yaml)}</pre>
+        </div>
+      </section>`;
+    });
+    return html + `<p class="muted small">Effective pod request = max(app containers + sidecars, largest init container); a missing request falls back to the limit. A trailing <b>+</b> means a container has no limit. CronJob/Job pods count while running.</p></div></details>`;
+  }
+
+  function issuesByDoc(m, topo) {
+    const out = new Map();
+    const add = (doc, sev, msg) => {
+      if (doc == null || doc < 0) return;
+      const e = out.get(doc) || { sev: "info", msgs: [] };
+      if (RANK[sev] > RANK[e.sev]) e.sev = sev;
+      e.msgs.push(msg);
+      out.set(doc, e);
+    };
+    m.namespaces.forEach((ns) => ns.workloads.forEach((w) => w.notes.forEach((n) => add(w.doc, n.sev, n.msg))));
+    if (topo) topo.issues.forEach((i) => add(i.doc, i.sev, i.msg));
+    return out;
+  }
+
+  function mapCard(c, iss) {
+    const w = c.workload;
+    const r = w && w.replicas;
+    const stack = w && (r.max ?? r.n) > 1;
+    const badgeText = !w ? "" : r.perNode ? `${r.n}<small>/node</small>` : r.max != null ? `${r.n}–${r.max}` : String(r.n);
+    const status = iss && iss.sev !== "info" ? `<span class="mc-st ${iss.sev}" title="${esc(iss.msgs.join("\n"))}">${iss.sev === "error" ? "✗" : "!"}</span>` : "";
+    return `<div class="mc ${stack ? "stack" : ""}" data-action="jump-doc" data-doc="${c.doc}" title="${esc(c.kind + " " + c.name + (c.detail ? "\n" + c.detail : ""))}">
+      <span class="kic cat-${esc(c.category)}">${esc(abbr(c.kind))}</span>
+      <div class="mc-t"><div class="mc-k">${esc(c.kind)}${c.hook ? ` <span class="tag warn">hook</span>` : ""}</div>
+        <div class="mc-n">${esc(c.name)}</div>${c.detail ? `<div class="mc-d">${esc(c.detail)}</div>` : ""}</div>
+      ${w ? `<span class="badge ${r.max != null ? "wide" : ""}" title="${esc(r.note || "replicas")}">${badgeText}</span>` : ""}${status}
     </div>`;
   }
 
-  function mapHTML() {
+  function mapHTML(topo) {
     if (!S.docs.length) return `<div class="empty">Nothing rendered yet.</div>`;
     const m = HS.buildMap(S.docs, currentNs(), { nodes: S.dsNodes });
     const extra = new Set();
     m.namespaces.forEach((ns) => ns.workloads.forEach((w) => [w.pod.req, w.pod.lim].forEach((x) => Object.keys(x).forEach((k) => k !== "cpu" && k !== "memory" && extra.add(k)))));
     const keys = ["cpu", "memory", ...extra];
+    const iss = issuesByDoc(m, topo);
     const hasDS = m.namespaces.some((ns) => ns.workloads.some((w) => w.replicas.perNode));
-    const unb = (list) => keys.filter((k) => list.some((w) => w.pod.unbounded.includes(k)));
-    const allW = m.namespaces.flatMap((ns) => ns.workloads);
-    const a = m.all;
-    const totalsRows = (t, list) => {
-      const rows = [{ label: plural(t.pods, "pod"), res: t.total, unbounded: unb(list) }];
-      if (t.podsMax !== t.pods) rows.push({ label: `${t.podsMax} at HPA max`, res: t.max, unbounded: unb(list) });
-      if (t.podsPeak !== t.podsMax) rows.push({ label: `${t.podsPeak} rollout peak`, res: t.peak, unbounded: unb(list), cls: "muted-row", tip: "HPA max plus maxSurge pods during a rolling update: the number to size quotas for" });
-      return rows;
-    };
-    let out = `<div class="map">
-      <div class="summary"><div><b>${plural(a.workloads, "workload")}</b> <span class="muted">in ${plural(m.namespaces.filter((n) => n.workloads.length).length, "namespace")}</span></div>
-        ${a.workloads ? resTable(totalsRows(a, allW), keys) : ""}
-        ${hasDS ? `<label class="ctl">DaemonSet nodes <input id="ds-nodes" type="number" min="1" value="${S.dsNodes}" style="width:64px"></label>` : ""}
-        <div class="muted small">Totals multiply each pod's effective request/limit by replicas. A trailing <b>+</b> means some container has no limit. CronJob and Job pods count while running.</div>
+    const counts = {};
+    m.namespaces.forEach((ns) => ns.cards.forEach((c) => (counts[c.category] = (counts[c.category] || 0) + 1)));
+    const nIss = [...iss.values()].filter((e) => e.sev !== "info").length;
+    const show = (c) => !S.hideCats.includes(c.category) && (!S.issuesOnly || (iss.get(c.doc) && iss.get(c.doc).sev !== "info"));
+
+    let out = `<div class="map">${resourcesPanel(m, keys)}
+      <div class="map-bar">${HS.CATEGORIES.filter((c) => counts[c]).map((c) => `<button class="fchip ${S.hideCats.includes(c) ? "" : "on"}" data-action="toggle-cat" data-cat="${c}"><span class="sw cat-${c}"></span>${c} <span class="muted">${counts[c]}</span></button>`).join("")}
+        <button class="fchip ${S.issuesOnly ? "on" : ""}" data-action="toggle-issues" ${nIss ? "" : "disabled"}>Status: warning or error <span class="muted">${nIss}</span></button>
+        ${hasDS ? `<label class="ctl">DaemonSet nodes <input id="ds-nodes" type="number" min="1" value="${S.dsNodes}" style="width:60px"></label>` : ""}
       </div>`;
     m.namespaces.forEach((ns) => {
-      const otherList = Object.entries(ns.others).sort().map(([k, v]) => `${v} ${k}`).join(" · ");
-      out += `<section class="ns">
-        <div class="ns-h"><span class="muted">Namespace</span> <b>${esc(ns.name || "cluster-scoped")}</b>
-          ${ns.limitRange ? `<span class="tag" title="Defaults applied to containers without requests/limits">LimitRange ${esc(ns.limitRange)}</span>` : ""}</div>
-        ${ns.workloads.length ? `<div class="ns-tot">${resTable(totalsRows(ns, ns.workloads), keys)}</div>` : ""}
-        ${ns.quotas.length ? `<div class="quotas">${ns.quotas.map((q) => {
-          const pct = q.hard ? Math.min(100, (q.used / q.hard) * 100) : 100;
-          const f = (v) => (q.key === "pods" ? String(v) : HS.fmtRes(q.res, v));
-          return `<div class="q ${q.over ? "over" : ""}" title="ResourceQuota ${esc(q.quota)} vs rollout peak"><span class="mono">${esc(q.key)}</span><span class="bar"><i style="width:${pct}%"></i></span><span class="mono">${esc(f(q.used))} / ${esc(f(q.hard))}</span></div>`;
-        }).join("")}</div>` : ""}
-        ${ns.workloads.length ? `<div class="wl-grid">${ns.workloads.map((w) => workloadCard(w, keys)).join("")}</div>` : ""}
-        ${otherList ? `<div class="ns-f muted">Also in this namespace: ${esc(otherList)}</div>` : ""}
-      </section>`;
+      const cards = ns.cards.filter(show);
+      if (!cards.length) return;
+      out += `<section class="ns"><div class="ns-h">${ns.name ? `Namespace <b>${esc(ns.name)}</b>` : "<b>Cluster-scoped</b>"} <span class="muted small">${plural(ns.cards.length, "manifest")}</span></div>
+        <div class="mc-grid">${cards.map((c) => mapCard(c, iss.get(c.doc))).join("")}</div></section>`;
     });
     return out + `</div>`;
   }
@@ -519,6 +569,24 @@
     }
   }
 
+  document.addEventListener("toggle", (e) => { if (e.target.id === "res-panel") store.set("resOpen", e.target.open); }, true);
+
+  function copyText(text, btn) {
+    const done = (ok) => { btn.textContent = ok ? "Copied" : "Select and copy"; setTimeout(() => (btn.textContent = "Copy YAML"), 1500); };
+    try {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(selectPre(btn)));
+    } catch (e) { done(selectPre(btn)); }
+  }
+  function selectPre(btn) {
+    const pre = btn.closest(".suggest").querySelector("pre");
+    const r = document.createRange();
+    r.selectNodeContents(pre);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    return false;
+  }
+
   function redrawKeepScroll() {
     const c = $("#center-b");
     const top = c ? c.scrollTop : 0;
@@ -554,6 +622,14 @@
       case "hf-load": return hfLoad();
       case "hf-inventory": S.release = null; S.src = null; drawSide(); return drawMain();
       case "pick-release": return pickRelease(t.dataset.id);
+      case "toggle-cat": {
+        const c = t.dataset.cat;
+        S.hideCats = S.hideCats.includes(c) ? S.hideCats.filter((x) => x !== c) : S.hideCats.concat(c);
+        store.set("hideCats", S.hideCats);
+        return redrawKeepScroll();
+      }
+      case "toggle-issues": S.issuesOnly = !S.issuesOnly; return redrawKeepScroll();
+      case "copy-quota": return copyText(S.quotaYaml[t.dataset.ns] || "", t);
       case "jump-doc": {
         const d = +t.dataset.doc;
         if (d < 0) return;
@@ -597,6 +673,7 @@
       case "fold": S.fold = v; store.set("fold", v); return redrawKeepScroll();
       case "only-over": S.onlyOverridden = v; return drawMain();
       case "only-unref": S.onlyUnref = v; return drawMain();
+      case "headroom": S.headroom = Math.max(0, parseInt(v, 10) || 0); store.set("headroom", S.headroom); return redrawKeepScroll();
       case "ds-nodes": S.dsNodes = Math.max(1, parseInt(v, 10) || 1); store.set("dsNodes", S.dsNodes); return redrawKeepScroll();
       case "src-file": return openSrc(v, []);
       case "doc-filter": case "val-filter": {
