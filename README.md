@@ -31,6 +31,11 @@ Point it at a folder of charts or helmfiles and it shows:
   chip to toggle, Shift+click or a namespace band to show only that one) or by
   name, and group the table, graph and sidebar by namespace. The filter is
   remembered per helmfile and environment. Pick a release to render it.
+  The inventory's **Map** and **Topology** tabs render every release in the
+  filter and merge the results, so totals, the ResourceQuota suggestion and
+  Service → pod links cover a whole namespace, not one release. A single
+  release's Map shows its own share and links to the namespace view for the
+  quota. `installed: false` releases are left out.
 
 It never talks to a cluster. It runs your own `helm` and `helmfile` binaries,
 so the output is exactly what they produce.

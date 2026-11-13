@@ -30,6 +30,11 @@
     nsHide: [],
     invQuery: "",
     invGroup: store.get("invGroup", true),
+    invTab: "releases",
+    relCache: new Map(),  // "<file>|<env>|<ns>/<release>" -> helmfile template result
+    combining: null,      // { done, total } while releases render
+    combined: null,       // last merged render: { docs, origin, ... }
+    pendingJump: null,
     quotaYaml: {},
     fold: store.get("fold", true),
     docFilter: "",
@@ -315,7 +320,8 @@
     return `<span title="${esc(r.note || "")}">${s}</span>`;
   }
 
-  function resourcesPanel(m, keys) {
+  function resourcesPanel(m, keys, opts) {
+    opts = opts || {};
     const spaces = m.namespaces.filter((ns) => ns.workloads.length);
     if (!spaces.length) return "";
     const a = m.all;
@@ -335,7 +341,7 @@
         <div class="tbl-scroll"><table class="rt res-tbl"><thead><tr><th>Workload</th><th>QoS</th><th>Pods</th><th class="grp" colspan="${keys.length}">Per pod</th><th class="grp" colspan="${keys.length}">× replicas</th></tr>
           <tr><th></th><th></th><th></th>${resHead(keys)}${resHead(keys)}</tr></thead><tbody>
           ${ns.workloads.map((w) => `<tr data-action="jump-doc" data-doc="${w.doc}" class="wrow">
-            <td>${esc(w.name)}<span class="kindt">${esc(w.kind)}</span>${w.notes.some((n) => n.sev !== "info") ? ' <span class="dot warn" title="see notes below">!</span>' : ""}</td>
+            <td>${esc(w.name)}<span class="kindt">${esc(w.kind)}${w.release ? " · " + esc(w.release) : ""}</span>${w.notes.some((n) => n.sev !== "info") ? ' <span class="dot warn" title="see notes below">!</span>' : ""}</td>
             <td><span class="qos q-${w.qos}">${w.qos}</span></td><td>${podsLabel(w)}</td>
             ${keys.map((k) => resCell(w.pod, k, w.pod.unbounded.includes(k))).join("")}
             ${keys.map((k) => resCell(w.total, k, w.pod.unbounded.includes(k))).join("")}</tr>`).join("")}
@@ -343,18 +349,20 @@
         <table class="rt res-tot"><thead><tr><th>Namespace total</th>${resHead(keys)}</tr></thead><tbody>${totalsRows(ns, ns.unbounded, keys)}
           ${ns.storage.claims ? `<tr class="tot"><td>${plural(ns.storage.claims, "PVC")}</td><td colspan="${keys.length}">${esc(HS.fmtBytes(ns.storage.bytes))} storage requested${ns.workloads.some((w) => w.kind === "StatefulSet") ? " <span class=\"muted\">(StatefulSet claims × replicas)</span>" : ""}</td></tr>` : ""}</tbody></table>
         ${notes.length ? `<div class="notes"><div class="sub">Notes</div>${notes.map((n) => `<div class="note ${n.sev}" data-action="jump-doc" data-doc="${n.w.doc}"><b>${esc(n.w.name)}</b> ${esc(n.msg)}</div>`).join("")}</div>` : ""}
-        ${ns.quotas.length ? `<div class="sub">Rendered ResourceQuota vs rollout peak</div><div class="quotas">${ns.quotas.map((qq) => {
+        ${!opts.quota ? `<div class="note info">ResourceQuota covers the whole namespace, so it's sized across every release in it, not this one alone.
+          <span class="link" data-action="inv-map" data-ns="${esc(ns.name)}">Open the Map for namespace ${esc(ns.name)}</span></div>` : ""}
+        ${opts.quota && ns.quotas.length ? `<div class="sub">Rendered ResourceQuota vs rollout peak</div><div class="quotas">${ns.quotas.map((qq) => {
           const pct = qq.hard ? Math.min(100, (qq.used / qq.hard) * 100) : 100;
           const f = (v) => (qq.count ? String(v) : HS.fmtRes(qq.res, v));
           return `<div class="q ${qq.over ? "over" : ""}" title="ResourceQuota ${esc(qq.quota)}"><span class="mono">${esc(qq.key)}</span><span class="bar"><i style="width:${pct}%"></i></span><span class="mono">${esc(f(qq.used))} / ${esc(f(qq.hard))}</span></div>`;
         }).join("")}</div>` : ""}
-        <div class="suggest">
+        ${opts.quota ? `<div class="suggest">
           <div class="sub">Suggested ResourceQuota${ns.suggestedLimitRange ? " + LimitRange" : ""}
             <label class="ctl">headroom <input class="headroom" id="headroom" type="number" min="0" max="300" step="5" value="${S.headroom}" style="width:62px">%</label>
             <button class="btn sm" data-action="copy-quota" data-ns="${esc(ns.name)}">Copy YAML</button></div>
           ${q.notes.map((n) => `<div class="note ${n.sev}">${esc(n.msg)}</div>`).join("")}
           <pre class="code yaml-out">${esc(q.yaml)}</pre>
-        </div>
+        </div>` : ""}
       </section>`;
     });
     return html + `<p class="muted small">Effective pod request = max(app containers + sidecars, largest init container); a missing request falls back to the limit. A trailing <b>+</b> means a container has no limit. CronJob/Job pods count while running.</p></div></details>`;
@@ -382,15 +390,19 @@
     const status = iss && iss.sev !== "info" ? `<span class="mc-st ${iss.sev}" title="${esc(iss.msgs.join("\n"))}">${iss.sev === "error" ? "✗" : "!"}</span>` : "";
     return `<div class="mc ${stack ? "stack" : ""}" data-action="jump-doc" data-doc="${c.doc}" title="${esc(c.kind + " " + c.name + (c.detail ? "\n" + c.detail : ""))}">
       <span class="kic cat-${esc(c.category)}">${esc(abbr(c.kind))}</span>
-      <div class="mc-t"><div class="mc-k">${esc(c.kind)}${c.hook ? ` <span class="tag warn">hook</span>` : ""}</div>
+      <div class="mc-t"><div class="mc-k">${esc(c.kind)}${c.release ? ` <span class="tag rel" title="release">${esc(c.release)}</span>` : ""}${c.hook ? ` <span class="tag warn">hook</span>` : ""}</div>
         <div class="mc-n">${esc(c.name)}</div>${c.detail ? `<div class="mc-d">${esc(c.detail)}</div>` : ""}</div>
       ${w ? `<span class="badge ${r.max != null ? "wide" : ""}" title="${esc(r.note || "replicas")}">${badgeText}</span>` : ""}${status}
     </div>`;
   }
 
-  function mapHTML(topo) {
-    if (!S.docs.length) return `<div class="empty">Nothing rendered yet.</div>`;
-    const m = HS.buildMap(S.docs, currentNs(), { nodes: S.dsNodes });
+  // mapHTML draws the Map tab. quota: show the ResourceQuota suggestion, which
+  // only makes sense for a whole namespace (chart mode, helmfile inventory).
+  function mapHTML(topo, docs, defaultNs, opts) {
+    docs = docs || S.docs;
+    opts = opts || { quota: S.mode === "chart" };
+    if (!docs.length) return `<div class="empty">Nothing rendered yet.</div>`;
+    const m = HS.buildMap(docs, defaultNs || currentNs(), { nodes: S.dsNodes });
     const extra = new Set();
     m.namespaces.forEach((ns) => ns.workloads.forEach((w) => [w.pod.req, w.pod.lim].forEach((x) => Object.keys(x).forEach((k) => k !== "cpu" && k !== "memory" && extra.add(k)))));
     const keys = ["cpu", "memory", ...extra];
@@ -401,7 +413,7 @@
     const nIss = [...iss.values()].filter((e) => e.sev !== "info").length;
     const show = (c) => !S.hideCats.includes(c.category) && (!S.issuesOnly || (iss.get(c.doc) && iss.get(c.doc).sev !== "info"));
 
-    let out = `<div class="map">${resourcesPanel(m, keys)}
+    let out = `<div class="map">${resourcesPanel(m, keys, opts)}
       <div class="map-bar">${HS.CATEGORIES.filter((c) => counts[c]).map((c) => `<button class="fchip ${S.hideCats.includes(c) ? "" : "on"}" data-action="toggle-cat" data-cat="${c}"><span class="sw cat-${c}"></span>${c} <span class="muted">${counts[c]}</span></button>`).join("")}
         <button class="fchip ${S.issuesOnly ? "on" : ""}" data-action="toggle-issues" ${nIss ? "" : "disabled"}>Status: warning or error <span class="muted">${nIss}</span></button>
         ${hasDS ? `<label class="ctl">DaemonSet nodes <input id="ds-nodes" type="number" min="1" value="${S.dsNodes}" style="width:60px"></label>` : ""}
@@ -418,7 +430,7 @@
   // ---- topology: how traffic gets from the edge to pods ------------------------------
 
   function topologyHTML(t) {
-    if (!S.docs.length) return `<div class="empty">Nothing rendered yet.</div>`;
+    if (!t) return `<div class="empty">Nothing rendered yet.</div>`;
     const iss = t.issues.length ? `<div class="issues">${t.issues.map((i) => `<div class="iss ${i.sev}" ${i.doc >= 0 ? `data-action="jump-doc" data-doc="${i.doc}"` : ""}><b>${i.sev === "error" ? "broken" : i.sev === "warn" ? "check" : "note"}</b> ${esc(i.msg)}</div>`).join("")}</div>` : "";
     const unexp = t.unexposed.length ? `<p class="muted" style="margin:10px 0 0">Not behind any Service: ${t.unexposed.map((u) => `<span class="chip" data-action="jump-doc" data-doc="${u.doc}">${esc(u.kind)} ${esc(u.name)}</span>`).join(" ")}</p>` : "";
     if (!t.nodes.length) return `<div class="graph-wrap">${iss}<div class="empty">No Services, Ingresses, Routes or HTTPRoutes in this render.</div>${unexp}</div>`;
@@ -650,9 +662,23 @@
         return setNsHide(HS.groupByNamespace(S.hf.releases).map((g) => g.ns).filter((n) => n !== ns));
       }
       case "ns-all": return setNsHide([]);
+      case "inv-tab": S.invTab = t.dataset.tab; return drawMain();
+      case "comb-refresh":
+        visibleReleases().forEach((r) => S.relCache.delete(relKey(r)));
+        return drawMain();
+      case "inv-map": {
+        const ns = t.dataset.ns;
+        S.release = null; S.src = null; S.invTab = "map";
+        return setNsHide(HS.groupByNamespace(S.hf.releases).map((g) => g.ns).filter((n) => n !== ns));
+      }
       case "jump-doc": {
         const d = +t.dataset.doc;
         if (d < 0) return;
+        if (S.mode === "helmfile" && !S.release && S.combined && S.combined.origin[d]) {
+          const o = S.combined.origin[d];
+          S.pendingJump = o.idx;
+          return pickRelease(o.rel);
+        }
         S.tab = "manifests";
         S.pickedDoc = d; S.pickedLine = -1;
         drawMain();
@@ -756,7 +782,7 @@
   function safeLoad(t) { try { return HS.yaml.load(t || "") || {}; } catch (e) { return null; } }
 
   async function rerender(force) {
-    if (S.mode === "helmfile") return S.release && renderRelease();
+    if (S.mode === "helmfile") return S.release && renderRelease(false, true);
     if (!S.chart) return;
     if (S.busy) { S.pending = true; return; }
     const valuesText = $("#values") ? $("#values").value : store.get("values:" + S.chart.path, "");
@@ -813,7 +839,7 @@
 
   async function hfLoad() {
     if (!S.hfFile) return;
-    S.busy = true; S.release = null; S.hf = null;
+    S.busy = true; S.release = null; S.hf = null; S.relCache = new Map(); S.combined = null;
     drawSide(); drawMain();
     let res;
     try {
@@ -922,6 +948,9 @@
           <span class="grow"></span>
           <label class="ctl"><input type="checkbox" id="inv-group" ${grouped ? "checked" : ""}> group by namespace</label>
         </div>
+        <div class="tabs inv-tabs">${[["releases", "Releases"], ["map", "Map"], ["topology", "Topology"]].map(([k, l]) => `<button data-action="inv-tab" data-tab="${k}" class="${S.invTab === k ? "on" : ""}">${l}</button>`).join("")}
+          <span class="muted small">${S.invTab === "releases" ? "" : `all ${plural(R.filter((r) => r.installed).length, "release")} in the filter, rendered together`}</span></div>
+        ${S.invTab !== "releases" ? combinedHTML() : `
         <div class="card"><h3>Releases <span class="muted">(${R.length === ALL.length ? ALL.length : `${R.length} of ${ALL.length}`})</span></h3>
         <table><thead><tr><th>Release</th>${grouped ? "" : "<th>Namespace</th>"}<th>Chart</th><th>Version</th><th>Needs</th><th>Labels</th><th>Values</th></tr></thead><tbody>
         ${body}
@@ -929,8 +958,97 @@
         <div class="card"><h3>Dependency order <span class="muted">(needs)</span></h3>
           ${cycles.length ? `<div class="errbar">Cycle through: ${cycles.map(esc).join(", ")}</div>` : ""}
           ${missing.length ? `<div class="errbar">Missing needs: ${missing.map((m) => `${esc(m.from)} → ${esc(m.to)}`).join(", ")}</div>` : ""}
-          <div class="graph-wrap">${R.length ? invGraphHTML(R, depth) : `<p class="muted">No releases match the filter.</p>`}</div></div>
+          <div class="graph-wrap">${R.length ? invGraphHTML(R, depth) : `<p class="muted">No releases match the filter.</p>`}</div></div>`}
       </div>`;
+  }
+
+  // ---- combined render: every release in the filter, merged ---------------------
+
+  const relKey = (r) => `${S.hfFile}|${S.hfEnv}|${r.id}`;
+  const inflight = new Set();
+  let redrawTimer = 0;
+
+  // redrawInventory repaints without losing focus in the filter box.
+  function redrawInventory() {
+    clearTimeout(redrawTimer);
+    redrawTimer = setTimeout(() => {
+      if (S.mode !== "helmfile" || S.release || !S.hf) return;
+      const a = document.activeElement;
+      const id = a && a.id;
+      const sel = a && "selectionStart" in a ? [a.selectionStart, a.selectionEnd] : null;
+      const b = $("#main .inv");
+      const top = b ? b.scrollTop : 0;
+      drawMain();
+      const b2 = $("#main .inv");
+      if (b2) b2.scrollTop = top;
+      if (id && $("#" + id)) {
+        $("#" + id).focus();
+        if (sel) try { $("#" + id).setSelectionRange(sel[0], sel[1]); } catch (e) { /* not a text field */ }
+      }
+    }, 60);
+  }
+
+  function ensureCombined(releases) {
+    const todo = releases.filter((r) => !S.relCache.has(relKey(r)) && !inflight.has(relKey(r)));
+    if (!todo.length) return;
+    todo.forEach((r) => inflight.add(relKey(r)));
+    S.combining = S.combining || { done: 0, total: 0 };
+    S.combining.total += todo.length;
+    const queue = todo.slice();
+    const worker = async () => {
+      while (queue.length) {
+        const r = queue.shift();
+        const key = relKey(r);
+        let res;
+        try {
+          res = await api("helmfile/template", { file: S.hfFile, env: S.hfEnv, release: r.name, namespace: r.namespace, kubeVersion: S.form.kubeVersion });
+        } catch (e) {
+          res = { ok: false, stdout: "", stderr: e.message, cmd: "", durationMs: 0 };
+        }
+        inflight.delete(key);
+        if (!key.startsWith(`${S.hfFile}|${S.hfEnv}|`)) continue; // helmfile/env changed meanwhile
+        S.relCache.set(key, res);
+        if (S.combining) S.combining.done++;
+        if (!inflight.size) S.combining = null;
+        redrawInventory();
+      }
+    };
+    Array.from({ length: Math.min(4, todo.length) }, worker);
+  }
+
+  function combinedDocs(releases) {
+    const docs = [], origin = [], failed = [], pending = [];
+    releases.forEach((r) => {
+      const res = S.relCache.get(relKey(r));
+      if (!res) return pending.push(r);
+      if (!res.ok) failed.push({ r, res });
+      HS.splitManifest(res.stdout).docs.forEach((d, i) => {
+        origin.push({ rel: r.id, idx: i });
+        // helm template leaves metadata.namespace out unless the chart sets it;
+        // the release's namespace is where the object will land
+        docs.push(Object.assign({}, d, { index: docs.length, namespace: d.namespace || r.namespace || "", release: r.name }));
+      });
+    });
+    return { docs, origin, failed, pending };
+  }
+
+  function combinedHTML() {
+    const vis = visibleReleases();
+    const R = vis.filter((r) => r.installed);
+    const skipped = vis.filter((r) => !r.installed);
+    ensureCombined(R);
+    const c = combinedDocs(R);
+    S.combined = c;
+    const nNs = HS.groupByNamespace(R).length;
+    const head = `<div class="comb-h">
+        ${S.combining ? `<span class="status"><span class="spin"></span> rendering ${S.combining.done}/${S.combining.total} releases…</span>` : `<span class="muted small">${plural(R.length - c.pending.length, "release")} · ${plural(nNs, "namespace")} · ${plural(c.docs.length, "manifest")}</span>`}
+        <span class="grow"></span><button class="btn sm" data-action="comb-refresh" ${S.combining ? "disabled" : ""}>Re-render</button></div>
+      ${c.failed.length ? `<div class="errbar">${c.failed.map((f) => `<div><span class="link" data-action="pick-release" data-id="${esc(f.r.id)}">${esc(f.r.id)}</span> failed to render: ${esc(lastLines(f.res.stderr, 2))}</div>`).join("")}</div>` : ""}
+      ${skipped.length ? `<p class="muted small">Left out (installed: false): ${skipped.map((r) => esc(r.id)).join(", ")}</p>` : ""}`;
+    if (!R.length) return head + `<div class="empty">No releases match the filter.</div>`;
+    if (!c.docs.length) return head + `<div class="empty">${c.pending.length ? "Rendering releases…" : "The releases rendered no manifests."}</div>`;
+    const topo = HS.buildTopology(c.docs, "default", { nodes: S.dsNodes });
+    return head + (S.invTab === "map" ? mapHTML(topo, c.docs, "default", { quota: true }) : `<div class="comb-topo">${topologyHTML(topo)}</div>`);
   }
 
   async function pickRelease(id) {
@@ -940,15 +1058,16 @@
     S.files = null; S.src = null; S.res = null; S.docs = []; S.errors = []; S.notes = []; S.pickedDoc = -1; S.chartNote = "";
     S.layers = HS.releaseLayers(rel, {});
     drawSide();
-    renderRelease(true);
+    renderRelease(true, false);
   }
 
-  async function renderRelease(withChart) {
+  async function renderRelease(withChart, force) {
     const rel = S.release;
     S.busy = true;
     drawMain();
     const base = { file: S.hfFile, env: S.hfEnv, release: rel.name, namespace: rel.namespace };
-    const tpl = api("helmfile/template", Object.assign({ kubeVersion: S.form.kubeVersion }, base)).catch((e) => ({ ok: false, stdout: "", stderr: e.message, cmd: "", durationMs: 0 }));
+    const cached = !force && S.relCache.get(relKey(rel));
+    const tpl = cached ? Promise.resolve(cached) : api("helmfile/template", Object.assign({ kubeVersion: S.form.kubeVersion }, base)).catch((e) => ({ ok: false, stdout: "", stderr: e.message, cmd: "", durationMs: 0 }));
     const ch = withChart || !S.files ? api("helmfile/chart", Object.assign({ chart: rel.chart }, base)).catch((e) => ({ error: e.message })) : null;
     const [res, chart] = await Promise.all([tpl, ch]);
     if (S.release !== rel) return; // user moved on
@@ -963,7 +1082,18 @@
     }
     // chart + subchart defaults, then the release's own layers
     S.layers = chartLayers().concat(HS.releaseLayers(rel, {}).slice(1));
+    S.relCache.set(relKey(rel), res);
     applyResult(res);
+    if (S.pendingJump != null) {
+      const j = S.pendingJump;
+      S.pendingJump = null;
+      if (j < S.docs.length) {
+        S.tab = "manifests"; S.pickedDoc = j; S.pickedLine = -1;
+        drawMain();
+        const el = $("#doc-" + j);
+        if (el) el.scrollIntoView({ block: "start" });
+      }
+    }
   }
 
   boot();

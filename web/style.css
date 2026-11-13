@@ -286,3 +286,12 @@ svg.graph .band:hover rect { stroke: var(--accent); }
 svg.graph .band text { font: 600 12px var(--mono); fill: var(--text); }
 svg.graph .band tspan.bl { font-weight: 400; fill: var(--muted); }
 svg.graph .edge { pointer-events: none; }
+
+/* ---- inventory: combined Map / Topology ---- */
+.inv-tabs { display: flex; align-items: center; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+.inv-tabs .small { margin-left: 10px; }
+.comb-h { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.comb-h .grow { flex: 1; }
+.inv .map { padding: 0; }
+.comb-topo .graph-wrap { padding: 0; }
+.tag.rel { font-family: var(--mono); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }

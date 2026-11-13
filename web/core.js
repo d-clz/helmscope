@@ -394,7 +394,7 @@
     objs.forEach((d) => {
       const ns = nsOf(d);
       const sp = space(ns);
-      const card = { doc: d.index, kind: d.kind, name: d.name, category: categoryOf(d.kind), detail: describe(d), hook: d.hook, workload: null };
+      const card = { doc: d.index, kind: d.kind, name: d.name, category: categoryOf(d.kind), detail: describe(d), hook: d.hook, release: d.release || "", workload: null };
       sp.cards.push(card);
       all.manifests++;
       if (d.kind === "PersistentVolumeClaim") {
@@ -419,7 +419,7 @@
         });
       }
       const w = {
-        doc: d.index, kind: d.kind, name: d.name, ns, replicas: rep, surge, pod, refs,
+        doc: d.index, kind: d.kind, name: d.name, ns, release: d.release || "", replicas: rep, surge, pod, refs,
         total: addRes(zeroRes(), pod, rep.n),
         max: addRes(zeroRes(), pod, hi),
         peak: addRes(zeroRes(), pod, hi + surge),
