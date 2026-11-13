@@ -1049,6 +1049,19 @@
     return layers;
   }
 
+  // groupByNamespace returns [{ns, releases}] sorted by namespace, releases by name.
+  function groupByNamespace(releases) {
+    const m = new Map();
+    releases.forEach((r) => {
+      const k = r.namespace || "";
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(r);
+    });
+    return [...m.entries()]
+      .sort((a, b) => (a[0] === "") - (b[0] === "") || a[0].localeCompare(b[0]))
+      .map(([ns, rs]) => ({ ns, releases: rs.sort((a, b) => a.name.localeCompare(b.name)) }));
+  }
+
   // needsLayers ranks releases by dependency depth for the inventory DAG.
   function needsLayers(releases) {
     const byId = new Map(releases.map((r) => [r.id, r]));
@@ -1080,7 +1093,7 @@
     suggestQuota, describe, categoryOf, CATEGORIES,
     flatten, coalesce, provenance, parseSet, setPath, valueRefs, isReferenced, pathKey,
     parseErrors, defines, includes, helpersClosure, mapLine,
-    parseHelmfileState, releaseLayers, needsLayers,
+    parseHelmfileState, releaseLayers, needsLayers, groupByNamespace,
     isObj, yaml: jsyaml,
   };
 });

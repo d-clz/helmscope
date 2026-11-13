@@ -33,3 +33,12 @@ releases:
   installed: false
   needs:
   - queue
+- chart: ./charts/web
+  name: web
+  namespace: apps-external
+  needs:
+  - platform/redis-shared
+- chart: nexus/redis
+  version: 18.1.0
+  name: redis-shared
+  namespace: apps-external
