@@ -27,6 +27,9 @@
     headroom: store.get("headroom", 20),
     hideCats: store.get("hideCats", []),
     issuesOnly: false,
+    nsHide: [],
+    invQuery: "",
+    invGroup: store.get("invGroup", true),
     quotaYaml: {},
     fold: store.get("fold", true),
     docFilter: "",
@@ -111,13 +114,19 @@
       <button class="btn primary" data-action="hf-load" style="width:100%">${S.busy && !S.release ? '<span class="spin"></span> ' : ""}Load releases</button>`
       : `<p class="muted">No helmfile.yaml, helmfile.yaml.gotmpl or helmfile.d/ found under the root.</p>`;
     if (S.hf && S.hf.releases.length) {
-      html += `<ul class="list" style="margin-top:10px">
-        <li data-action="hf-inventory" class="${S.release ? "" : "on"}"><div class="t">Inventory</div><div class="s">${S.hf.releases.length} releases · ${esc(S.hfEnv)}</div></li>
-        ${S.hf.releases.map((r) => `
+      const vis = visibleReleases();
+      const nNs = HS.groupByNamespace(S.hf.releases).length;
+      const item = (r) => `
         <li data-action="pick-release" data-id="${esc(r.id)}" class="${S.release && S.release.id === r.id ? "on" : ""}">
           <div class="t">${esc(r.name)}${r.installed ? "" : '<span class="tag warn">installed: false</span>'}</div>
-          <div class="s">${esc(r.namespace || "-")} · ${esc(r.chart)}${r.version ? "@" + esc(r.version) : ""}</div>
-        </li>`).join("")}</ul>`;
+          <div class="s">${S.invGroup ? "" : esc(r.namespace || "-") + " · "}${esc(r.chart)}${r.version ? "@" + esc(r.version) : ""}</div>
+        </li>`;
+      html += `<ul class="list" style="margin-top:10px">
+        <li data-action="hf-inventory" class="${S.release ? "" : "on"}"><div class="t">Inventory</div><div class="s">${S.hf.releases.length} releases · ${nNs} namespace${nNs === 1 ? "" : "s"} · ${esc(S.hfEnv)}</div></li>
+        ${vis.length < S.hf.releases.length ? `<li class="grp">showing ${vis.length} of ${S.hf.releases.length} <span class="link" data-action="ns-all">show all</span></li>` : ""}
+        ${S.invGroup
+          ? HS.groupByNamespace(vis).map((g) => `<li class="grp">${esc(nsLabel(g.ns))} <span class="muted">${g.releases.length}</span></li>${g.releases.map(item).join("")}`).join("")
+          : vis.map(item).join("")}</ul>`;
     }
     el.innerHTML = html;
   }
@@ -630,6 +639,17 @@
       }
       case "toggle-issues": S.issuesOnly = !S.issuesOnly; return redrawKeepScroll();
       case "copy-quota": return copyText(S.quotaYaml[t.dataset.ns] || "", t);
+      case "ns-toggle": {
+        const ns = t.dataset.ns;
+        const names = HS.groupByNamespace(S.hf.releases).map((g) => g.ns);
+        if (e.shiftKey) return setNsHide(names.filter((n) => n !== ns));
+        return setNsHide(S.nsHide.includes(ns) ? S.nsHide.filter((n) => n !== ns) : S.nsHide.concat(ns));
+      }
+      case "ns-only": {
+        const ns = t.dataset.ns;
+        return setNsHide(HS.groupByNamespace(S.hf.releases).map((g) => g.ns).filter((n) => n !== ns));
+      }
+      case "ns-all": return setNsHide([]);
       case "jump-doc": {
         const d = +t.dataset.doc;
         if (d < 0) return;
@@ -673,6 +693,15 @@
       case "fold": S.fold = v; store.set("fold", v); return redrawKeepScroll();
       case "only-over": S.onlyOverridden = v; return drawMain();
       case "only-unref": S.onlyUnref = v; return drawMain();
+      case "inv-group": S.invGroup = v; store.set("invGroup", v); drawSide(); return drawMain();
+      case "inv-q": {
+        S.invQuery = v;
+        drawSide();
+        drawMain();
+        const el = $("#inv-q");
+        if (el) { el.focus(); el.setSelectionRange(v.length, v.length); }
+        return;
+      }
       case "headroom": S.headroom = Math.max(0, parseInt(v, 10) || 0); store.set("headroom", S.headroom); return redrawKeepScroll();
       case "ds-nodes": S.dsNodes = Math.max(1, parseInt(v, 10) || 1); store.set("dsNodes", S.dsNodes); return redrawKeepScroll();
       case "src-file": return openSrc(v, []);
@@ -795,51 +824,112 @@
     S.busy = false;
     const st = HS.parseHelmfileState(res.stdout);
     S.hf = { releases: st.releases, res, error: res.ok ? st.error : lastLines(res.stderr, 12) || st.error };
+    const known = new Set(st.releases.map((r) => r.namespace || ""));
+    S.nsHide = store.get(nsStoreKey(), []).filter((n) => known.has(n));
     drawSide(); drawMain();
   }
 
-  function drawInventory(el) {
-    const R = S.hf.releases;
-    const { depth, cycles, missing } = HS.needsLayers(R);
-    const maxD = Math.max(0, ...depth.values());
-    const cols = Array.from({ length: maxD + 1 }, () => []);
-    R.forEach((r) => cols[depth.get(r.id) || 0].push(r));
-    const W = 200, H = 42, GX = 70, GY = 12;
+  // ---- helmfile inventory: namespace filter + grouping -------------------------
+
+  const nsLabel = (ns) => ns || "(no namespace)";
+  const nsStoreKey = () => `nsHide:${S.hfFile}:${S.hfEnv}`;
+
+  function visibleReleases() {
+    if (!S.hf) return [];
+    const q = S.invQuery.trim().toLowerCase();
+    return S.hf.releases.filter((r) => !S.nsHide.includes(r.namespace || "") && (!q || `${r.name} ${r.chart} ${r.namespace}`.toLowerCase().includes(q)));
+  }
+
+  function setNsHide(list) {
+    S.nsHide = list;
+    store.set(nsStoreKey(), list);
+    drawSide();
+    drawMain();
+  }
+
+  function invGraphHTML(R, depth) {
+    const grouped = S.invGroup;
+    const W = 200, H = 42, GX = 70, GY = 12, TOP = 22, PAD = grouped ? 14 : 0, HEAD = grouped ? 28 : 0;
+    const ids = new Set(R.map((r) => r.id));
+    const all = new Set(S.hf.releases.map((r) => r.id));
+    const maxD = Math.max(0, ...R.map((r) => depth.get(r.id) || 0));
     const pos = new Map();
-    cols.forEach((c, i) => c.forEach((r, j) => pos.set(r.id, { x: i * (W + GX), y: 22 + j * (H + GY) })));
-    const width = cols.length * (W + GX) - GX + 2, height = 22 + Math.max(1, ...cols.map((c) => c.length)) * (H + GY);
-    const edges = R.flatMap((r) => r.needs.filter((n) => pos.has(n)).map((n) => {
+    const bands = [];
+    let y = TOP;
+    (grouped ? HS.groupByNamespace(R) : [{ ns: null, releases: R }]).forEach((g) => {
+      const cols = Array.from({ length: maxD + 1 }, () => []);
+      g.releases.forEach((r) => cols[depth.get(r.id) || 0].push(r));
+      const rows = Math.max(1, ...cols.map((c) => c.length));
+      cols.forEach((c, i) => c.forEach((r, j) => pos.set(r.id, { x: PAD + i * (W + GX), y: y + HEAD + j * (H + GY) })));
+      const h = HEAD + rows * (H + GY) - GY + (grouped ? 12 : GY);
+      if (grouped) bands.push({ ns: g.ns, y, h, n: g.releases.length });
+      y += h + (grouped ? 14 : 0);
+    });
+    const width = 2 * PAD + (maxD + 1) * (W + GX) - GX + 2;
+    const height = y;
+    const bandsSvg = bands.map((b) => `<g class="band" data-action="ns-only" data-ns="${esc(b.ns)}"><title>Show only ${esc(nsLabel(b.ns))}</title>
+      <rect x="1" y="${b.y}" width="${width - 2}" height="${b.h}" rx="10"></rect>
+      <text x="${PAD}" y="${b.y + 18}"><tspan class="bl">namespace</tspan> ${esc(nsLabel(b.ns))} <tspan class="bl">· ${b.n}</tspan></text></g>`).join("");
+    const edges = R.flatMap((r) => r.needs.filter((n) => ids.has(n)).map((n) => {
       const a = pos.get(n), b = pos.get(r.id);
-      const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, dx = Math.max(30, (x2 - x1) / 2);
+      const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, dx = Math.max(30, Math.abs(x2 - x1) / 2);
       return `<path class="edge" d="M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}" marker-end="url(#arr2)"></path>`;
     })).join("");
     const nodes = R.map((r) => {
       const p = pos.get(r.id);
+      const hidden = r.needs.filter((n) => all.has(n) && !ids.has(n));
+      const sub = grouped ? r.chart : r.namespace || "-";
       return `<g class="node ${r.installed ? "" : "ghost"}" data-action="pick-release" data-id="${esc(r.id)}" transform="translate(${p.x},${p.y})">
-        <title>${esc(r.chart)}${r.version ? "@" + esc(r.version) : ""}</title>
+        <title>${esc(r.id)}\n${esc(r.chart)}${r.version ? "@" + esc(r.version) : ""}${hidden.length ? "\nneeds (filtered out): " + esc(hidden.join(", ")) : ""}</title>
         <rect width="${W}" height="${H}" style="stroke:var(--c${(depth.get(r.id) || 0) % 6})"></rect>
-        <text class="kind" x="10" y="15">${esc(r.namespace || "-")}</text><text x="10" y="31">${esc(r.name)}</text></g>`;
+        <text class="kind" x="10" y="15">${esc(sub.length > 26 ? sub.slice(0, 25) + "…" : sub)}${hidden.length ? ` · +${hidden.length} hidden need${hidden.length > 1 ? "s" : ""}` : ""}</text>
+        <text x="10" y="31">${esc(r.name)}</text></g>`;
     }).join("");
-    const heads = cols.map((c, i) => `<text class="colh" x="${i * (W + GX)}" y="12">${i === 0 ? "no needs" : "needs depth " + i}</text>`).join("");
+    const heads = Array.from({ length: maxD + 1 }, (_, i) => `<text class="colh" x="${PAD + i * (W + GX)}" y="12">${i === 0 ? "no needs" : "needs depth " + i}</text>`).join("");
+    return `<svg class="graph" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <defs><marker id="arr2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"></path></marker></defs>
+      ${bandsSvg}${heads}${edges}${nodes}</svg>`;
+  }
+
+  function drawInventory(el) {
+    const ALL = S.hf.releases;
+    const R = visibleReleases();
+    const { depth, cycles, missing } = HS.needsLayers(ALL);
+    const groups = HS.groupByNamespace(ALL);
+    const grouped = S.invGroup;
+    const row = (r) => `<tr class="r ${r.installed ? "" : "off"}" data-action="pick-release" data-id="${esc(r.id)}">
+      <td><b>${esc(r.name)}</b>${r.installed ? "" : ' <span class="tag warn">installed: false</span>'}${r.condition ? ` <span class="tag" title="condition">${esc(r.condition)}</span>` : ""}</td>
+      ${grouped ? "" : `<td class="mono">${esc(r.namespace || "-")}</td>`}<td class="mono">${esc(r.chart)}</td><td class="mono">${esc(r.version || "")}</td>
+      <td class="mono">${r.needs.map((n) => esc(n)).join("<br>")}</td>
+      <td class="mono">${Object.entries(r.labels).map(([k, v]) => esc(k + "=" + v)).join("<br>")}</td>
+      <td>${r.values.length} file${r.values.length === 1 ? "" : "s"}${r.set.length ? ` · ${r.set.length} set` : ""}</td></tr>`;
+    const ncols = grouped ? 6 : 7;
+    const body = !R.length
+      ? `<tr><td colspan="${ncols}" class="muted">No releases match the filter.</td></tr>`
+      : grouped
+        ? HS.groupByNamespace(R).map((g) => `<tr class="nsrow"><td colspan="${ncols}"><span class="muted">namespace</span> <b>${esc(nsLabel(g.ns))}</b> <span class="muted">· ${g.releases.length}</span>
+            <span class="link" data-action="ns-only" data-ns="${esc(g.ns)}">only this</span></td></tr>${g.releases.map(row).join("")}`).join("")
+        : R.map(row).join("");
+    const chips = groups.map((g) => `<button class="fchip ${S.nsHide.includes(g.ns) ? "" : "on"}" data-action="ns-toggle" data-ns="${esc(g.ns)}" title="Click to toggle · Shift+click to show only this namespace">${esc(nsLabel(g.ns))} <span class="muted">${g.releases.length}</span></button>`).join("");
     el.innerHTML = `<div class="toolbar"><div class="title">${esc(S.hfFile)}</div><span class="tag">env: ${esc(S.hfEnv)}</span>
         <span class="grow"></span><span class="status ${S.hf.res.ok ? "good" : "bad"}" title="${esc(S.hf.res.cmd || "")}">${S.hf.res.ok ? "✓" : "✗"} ${esc(S.hf.res.cmd || "")}</span></div>
       ${S.hf.error ? `<div class="errbar">${esc(S.hf.error)}</div>` : ""}
       <div class="inv">
-        <div class="card"><h3>Releases <span class="muted">(${R.length})</span></h3>
-        <table><thead><tr><th>Release</th><th>Namespace</th><th>Chart</th><th>Version</th><th>Needs</th><th>Labels</th><th>Values</th></tr></thead><tbody>
-        ${R.map((r) => `<tr class="r ${r.installed ? "" : "off"}" data-action="pick-release" data-id="${esc(r.id)}">
-          <td><b>${esc(r.name)}</b>${r.installed ? "" : ' <span class="tag warn">installed: false</span>'}${r.condition ? ` <span class="tag" title="condition">${esc(r.condition)}</span>` : ""}</td>
-          <td class="mono">${esc(r.namespace || "-")}</td><td class="mono">${esc(r.chart)}</td><td class="mono">${esc(r.version || "")}</td>
-          <td class="mono">${r.needs.map((n) => esc(n)).join("<br>")}</td>
-          <td class="mono">${Object.entries(r.labels).map(([k, v]) => esc(k + "=" + v)).join("<br>")}</td>
-          <td>${r.values.length} file${r.values.length === 1 ? "" : "s"}${r.set.length ? ` · ${r.set.length} set` : ""}</td></tr>`).join("")}
+        <div class="inv-bar">
+          <input id="inv-q" placeholder="filter releases or charts" value="${esc(S.invQuery)}" style="width:200px">
+          <span class="sub">Namespaces</span>${chips}
+          ${S.nsHide.length ? `<button class="fchip" data-action="ns-all">show all</button>` : ""}
+          <span class="grow"></span>
+          <label class="ctl"><input type="checkbox" id="inv-group" ${grouped ? "checked" : ""}> group by namespace</label>
+        </div>
+        <div class="card"><h3>Releases <span class="muted">(${R.length === ALL.length ? ALL.length : `${R.length} of ${ALL.length}`})</span></h3>
+        <table><thead><tr><th>Release</th>${grouped ? "" : "<th>Namespace</th>"}<th>Chart</th><th>Version</th><th>Needs</th><th>Labels</th><th>Values</th></tr></thead><tbody>
+        ${body}
         </tbody></table></div>
         <div class="card"><h3>Dependency order <span class="muted">(needs)</span></h3>
           ${cycles.length ? `<div class="errbar">Cycle through: ${cycles.map(esc).join(", ")}</div>` : ""}
           ${missing.length ? `<div class="errbar">Missing needs: ${missing.map((m) => `${esc(m.from)} → ${esc(m.to)}`).join(", ")}</div>` : ""}
-          <div class="graph-wrap"><svg class="graph" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-          <defs><marker id="arr2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"></path></marker></defs>
-          ${heads}${edges}${nodes}</svg></div></div>
+          <div class="graph-wrap">${R.length ? invGraphHTML(R, depth) : `<p class="muted">No releases match the filter.</p>`}</div></div>
       </div>`;
   }
 

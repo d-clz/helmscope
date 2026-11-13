@@ -305,7 +305,7 @@ t("parseErrors", () => {
 t("helmfile state + layers + needs", () => {
   const st = HS.parseHelmfileState(fs.readFileSync(path.join(td, "helmfile-build.yaml"), "utf8"));
   assert.strictEqual(st.error, "");
-  assert.strictEqual(st.releases.length, 3);
+  assert.strictEqual(st.releases.length, 5);
   const web = st.releases.find((r) => r.name === "web");
   assert.deepStrictEqual(web.needs, ["platform/redis-shared"]);
   const L = HS.releaseLayers(web, { replicaCount: 1, image: { tag: "1.4.0" } });
@@ -315,6 +315,17 @@ t("helmfile state + layers + needs", () => {
   const { depth, missing } = HS.needsLayers(st.releases);
   assert.strictEqual(depth.get("apps/web"), 1);
   assert.deepStrictEqual(missing, [{ from: "apps/worker", to: "apps/queue" }]);
+});
+
+t("groupByNamespace", () => {
+  const st = HS.parseHelmfileState(fs.readFileSync(path.join(td, "helmfile-build.yaml"), "utf8"));
+  const g = HS.groupByNamespace(st.releases);
+  assert.deepStrictEqual(g.map((x) => [x.ns, x.releases.map((r) => r.name)]), [
+    ["apps", ["web", "worker"]],
+    ["apps-external", ["redis-shared", "web"]],
+    ["platform", ["redis-shared"]],
+  ]);
+  assert.strictEqual(HS.groupByNamespace([{ name: "a", namespace: "" }, { name: "b", namespace: "z" }])[1].ns, "", "no-namespace group goes last");
 });
 
 console.log(`\n${n} passed`);

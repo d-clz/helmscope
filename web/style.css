@@ -270,3 +270,19 @@ table.rt th { text-align: left; font-weight: 600; font-size: 11px; padding: 3px 
 table.rt td { padding: 4px 8px; font-family: var(--mono); white-space: nowrap; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); }
 table.rt td:first-child { font-family: var(--sans); color: var(--muted); }
 table.rt .kindt { font: 10px var(--mono); color: var(--muted); margin-left: 4px; }
+
+/* ---- helmfile inventory: namespace filter and grouping ---- */
+.inv-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 12px; }
+.inv-bar .sub { margin: 0 0 0 8px; }
+.inv-bar .grow { flex: 1; }
+.inv tr.nsrow td { background: var(--panel-2); font-size: 12px; padding: 6px 10px; }
+.inv tr.nsrow b { font-family: var(--mono); }
+.inv tr.nsrow .link { margin-left: 10px; font-size: 11px; }
+.list li.grp { cursor: default; padding: 8px 8px 2px; font: 11px var(--mono); color: var(--muted); text-transform: none; border: 0; }
+.list li.grp:hover { background: none; }
+svg.graph .band { cursor: pointer; }
+svg.graph .band rect { fill: color-mix(in srgb, var(--panel-2) 55%, transparent); stroke: var(--line); }
+svg.graph .band:hover rect { stroke: var(--accent); }
+svg.graph .band text { font: 600 12px var(--mono); fill: var(--text); }
+svg.graph .band tspan.bl { font-weight: 400; fill: var(--muted); }
+svg.graph .edge { pointer-events: none; }

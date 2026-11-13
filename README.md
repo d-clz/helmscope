@@ -27,7 +27,10 @@ Point it at a folder of charts or helmfiles and it shows:
 - **Values provenance**: the final value of every key, which layer set it, and
   the values it overrode. Keys that no template reads directly are flagged.
 - **Helmfile inventory**: releases for an environment with chart, version,
-  `needs`, labels, and a dependency-order graph. Pick a release to render it.
+  `needs`, labels, and a dependency-order graph. Filter by namespace (click a
+  chip to toggle, Shift+click or a namespace band to show only that one) or by
+  name, and group the table, graph and sidebar by namespace. The filter is
+  remembered per helmfile and environment. Pick a release to render it.
 
 It never talks to a cluster. It runs your own `helm` and `helmfile` binaries,
 so the output is exactly what they produce.
