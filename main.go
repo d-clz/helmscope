@@ -97,7 +97,7 @@ func main() {
 	log.Printf("open:  http://%s", displayAddr(cfg.Addr))
 	hs := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           logRequests(mux),
+		Handler:           hostGuard(cfg.Addr, logRequests(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Fatal(hs.ListenAndServe())

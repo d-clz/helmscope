@@ -87,7 +87,7 @@ Or grab a prebuilt release from GitHub Releases or Nexus
 | Flag | Default | Meaning |
 |---|---|---|
 | `-root` / first arg | `.` | Folder scanned for `Chart.yaml`, `*.tgz`, `helmfile.yaml(.gotmpl)` and `helmfile.d/` |
-| `-addr` | `127.0.0.1:8088` | Listen address. There is no auth, so keep it on loopback |
+| `-addr` | `127.0.0.1:8088` | Listen address. There is no login, so keep it on loopback |
 | `-helm` | `helm` (`$HELMSCOPE_HELM`) | helm binary |
 | `-helmfile` | `helmfile` (`$HELMSCOPE_HELMFILE`) | helmfile binary |
 | `-kube-version` | helm's default (`$HELMSCOPE_KUBE_VERSION`) | Default `--kube-version` for `.Capabilities`, e.g. `1.30.0` for OCP 4.17 |
@@ -159,6 +159,30 @@ The exact command line is shown in the toolbar and the Log tab.
   they may hold Secret data, so treat the files accordingly.
 - **Secrets from `helm-secrets`/sops** are whatever helmfile renders. Use it on
   environments where that's acceptable, or render without the secrets layer.
+- **Secrets from `helm-secrets`/sops** are decrypted values, so they show up
+  in the rendered manifests. Use it on environments where that's acceptable.
+
+## SOPS keys
+
+helm secrets / sops find age keys the usual ways (`SOPS_AGE_KEY_FILE`,
+`%APPDATA%\sops\age\keys.txt`, `~/.config/sops/age/keys.txt`, …) from the
+environment helmscope was started in. You can also give a key at runtime:
+
+- Click **🔑 SOPS key** in the top bar and paste an `AGE-SECRET-KEY-1…` line,
+  or load a `keys.txt`. The button then shows the matching `age1…` recipient.
+- The key is held **in memory for that browser tab only**. Refreshing or
+  closing the tab forgets it (the page tells the server on unload), and an
+  idle tab's key expires after 8 hours. It's never written to disk, logged,
+  shown in a command line, or sent back to the browser.
+- helmscope passes it to helm/helmfile as `SOPS_AGE_KEY`, added to any
+  `SOPS_AGE_KEY` already set. A `SOPS_AGE_KEY_FILE` pointing at a missing file
+  is dropped for that call, because sops would otherwise stop there.
+- When a render fails to decrypt, a hint names the recipients the file is
+  encrypted to and says whether your key is one of them.
+
+Every API call carries a per-tab `X-Helmscope-Session` header, and on loopback
+the server only accepts `localhost`/`127.0.0.1` Host headers. That keeps other
+web pages (including DNS-rebinding tricks) from calling the API or using a key.
 
 ## Layout
 
