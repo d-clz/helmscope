@@ -328,4 +328,108 @@ t("groupByNamespace", () => {
   assert.strictEqual(HS.groupByNamespace([{ name: "a", namespace: "" }, { name: "b", namespace: "z" }])[1].ns, "", "no-namespace group goes last");
 });
 
+
+// ---- compare ----------------------------------------------------------------
+
+t("parseLive: Lists, plain objects, JSON, typed lists", () => {
+  const L = HS.parseLive(fs.readFileSync(path.join(td, "live.yaml"), "utf8"));
+  assert.strictEqual(L.error, "");
+  assert.strictEqual(L.docs.length, 14);
+  assert.deepStrictEqual(L.docs[0], Object.assign({}, L.docs[0], { kind: "Service", name: "demo-web", namespace: "default" }));
+  const j = HS.parseLive(JSON.stringify({ kind: "DeploymentList", items: [{ metadata: { name: "a", namespace: "n" } }] }));
+  assert.deepStrictEqual(j.docs.map((d) => [d.kind, d.name, d.namespace]), [["Deployment", "a", "n"]]);
+  assert.strictEqual(HS.parseLive("kind: Service\nmetadata: {name: x}\n---\nkind: [\n").docs.length, 1);
+  assert.ok(HS.parseLive("kind: [\n").error);
+});
+
+t("diffObject: subset compare, server defaults ignored", () => {
+  const want = { apiVersion: "v1", kind: "Service", metadata: { name: "a", labels: { x: "1" } }, spec: { ports: [{ name: "http", port: 80, targetPort: "http" }], selector: { app: "a" }, externalIPs: [] } };
+  const got = { apiVersion: "v1", kind: "Service", metadata: { name: "a", namespace: "n", uid: "u", labels: { x: "1", extra: "y" } }, spec: { clusterIP: "1.2.3.4", ports: [{ name: "http", port: 80, protocol: "TCP", targetPort: "http" }], selector: { app: "a" } }, status: {} };
+  assert.deepStrictEqual(HS.diffObject(want, got), []);
+});
+
+t("diffObject: keyed lists, quantities, scalars, extras", () => {
+  const want = { spec: { containers: [
+    { name: "web", image: "r/web:1", resources: { limits: { cpu: "500m", memory: "1Gi" } }, ports: [{ containerPort: 8080 }] },
+    { name: "side", image: "r/side:1" },
+  ], args: ["--a", "--b"] } };
+  const got = { spec: { containers: [
+    { name: "istio-proxy", image: "proxy" },
+    { name: "web", image: "r/web:2", resources: { limits: { cpu: "0.5", memory: "1024Mi" } }, ports: [{ containerPort: "8080", protocol: "TCP" }], env: [{ name: "X", value: "1" }] },
+  ], args: ["--a"] } };
+  const d = HS.diffObject(want, got);
+  const by = Object.fromEntries(d.map((x) => [x.path, x]));
+  assert.deepStrictEqual(Object.keys(by).sort(), [
+    "spec.args", "spec.containers[name=istio-proxy]", "spec.containers[name=side]",
+    "spec.containers[name=web].env", "spec.containers[name=web].image",
+  ]);
+  assert.strictEqual(by["spec.containers[name=web].image"].op, "changed");
+  assert.strictEqual(by["spec.containers[name=side]"].op, "missing");
+  assert.strictEqual(by["spec.containers[name=istio-proxy]"].op, "extra");
+  assert.strictEqual(by["spec.containers[name=web].env"].op, "extra"); // oc set env
+});
+
+t("diffObject: quantities only normalise under resource keys", () => {
+  assert.deepStrictEqual(HS.diffObject({ metadata: { annotations: { v: "1" } } }, { metadata: { annotations: { v: "1000m" } } }).length, 1);
+  assert.deepStrictEqual(HS.diffObject({ spec: { hard: { cpu: "2" } } }, { spec: { hard: { cpu: "2000m" } } }), []);
+});
+
+t("diffObject: ConfigMap data is exact, Secret stringData compares as data", () => {
+  const d = HS.diffObject({ kind: "ConfigMap", data: { a: "1" } }, { kind: "ConfigMap", data: { a: "1", b: "2" } });
+  assert.deepStrictEqual(d.map((x) => [x.path, x.op]), [["data.b", "extra"]]);
+  const r = HS.compareSets(
+    [{ index: 0, kind: "Secret", name: "s", namespace: "n", obj: { kind: "Secret", metadata: { name: "s" }, stringData: { pw: "héllo" } } }],
+    [{ index: 0, kind: "Secret", name: "s", namespace: "n", obj: { kind: "Secret", metadata: { name: "s", namespace: "n" }, data: { pw: Buffer.from("héllo").toString("base64") } } }],
+    "n");
+  assert.strictEqual(r.items[0].status, "match");
+});
+
+t("compareSets: rendered chart vs exported namespace", () => {
+  const desired = HS.splitManifest(rendered).docs;
+  const live = HS.parseLive(fs.readFileSync(path.join(td, "live.yaml"), "utf8")).docs;
+  const r = HS.compareSets(desired, live, "default");
+  const st = Object.fromEntries(r.items.map((i) => [`${i.kind}/${i.name}`, i.status]));
+  assert.deepStrictEqual(st, {
+    "Service/demo-web": "match", "Service/demo-web-metrics": "match", "Service/demo-redis": "match",
+    "Deployment/demo-web": "drift", "CronJob/demo-web-cleanup": "missing",
+    "HorizontalPodAutoscaler/demo-web": "match", "Ingress/demo-web": "match",
+    "Route/demo-web-admin": "match", "StatefulSet/demo-redis": "match",
+  });
+  const dep = r.items.find((i) => i.kind === "Deployment");
+  assert.deepStrictEqual(dep.diffs.map((x) => [x.path, x.op, x.note || ""]), [
+    ["spec.replicas", "changed", "an HPA scales this"],
+    ["spec.template.spec.containers[name=web].image", "changed", ""],
+    ["spec.template.spec.containers[name=web].env", "extra", ""],
+  ]);
+  assert.deepStrictEqual(r.extras.map((e) => [e.name, e.helmRelease]), [["demo-web-env", ""], ["old-web-config", "old-web"]]);
+  assert.deepStrictEqual(r.skipped.map((e) => [e.name, e.why]), [
+    ["demo-web-6d9f7c8b5", "owned by Deployment"], ["kube-root-ca.crt", "namespace default"], ["builder-dockercfg-x7k2p", "service account secret"],
+  ]);
+  assert.deepStrictEqual(r.counts, { match: 7, drift: 1, missing: 1, hook: 0, extra: 2 });
+  // wrong namespace: nothing matches, nothing from the export is "extra"
+  const r2 = HS.compareSets(desired, live, "prod");
+  assert.strictEqual(r2.counts.missing, 9);
+  assert.strictEqual(r2.extras.length, 0);
+});
+
+t("compareSets: hooks, namespace-less exports, injected SA secrets", () => {
+  const desired = [
+    { index: 0, kind: "Job", name: "migrate", hook: "pre-upgrade", obj: { kind: "Job", metadata: { name: "migrate" } } },
+    { index: 1, kind: "ServiceAccount", name: "app", obj: { kind: "ServiceAccount", metadata: { name: "app" } } },
+  ];
+  const live = [{ index: 0, kind: "ServiceAccount", name: "app", namespace: "", obj: { kind: "ServiceAccount", metadata: { name: "app" }, secrets: [{ name: "app-dockercfg-ab12c" }], imagePullSecrets: [{ name: "app-dockercfg-ab12c" }] } }];
+  const r = HS.compareSets(desired, live, "x");
+  assert.deepStrictEqual(r.items.map((i) => i.status), ["hook", "match"]);
+});
+
+t("exportCommand", () => {
+  const desired = HS.splitManifest(rendered).docs;
+  assert.strictEqual(HS.exportCommand(desired, "uat"),
+    "oc get cronjob.batch,deployment.apps,horizontalpodautoscaler.autoscaling,ingress.networking.k8s.io,route.route.openshift.io,service,statefulset.apps -n uat -o yaml > live-uat.yaml");
+  const multi = desired.slice(0, 2).map((d, i) => Object.assign({}, d, { namespace: ["a", "b"][i] }))
+    .concat([{ kind: "ClusterRole", apiVersion: "rbac.authorization.k8s.io/v1", name: "r", obj: {} }]);
+  assert.strictEqual(HS.exportCommand(multi, "x", "kubectl"),
+    'for ns in a b; do kubectl get service -n "$ns" -o yaml; echo ---; done > live.yaml\nkubectl get clusterrole.rbac.authorization.k8s.io/r -o yaml > live-cluster.yaml');
+});
+
 console.log(`\n${n} passed`);

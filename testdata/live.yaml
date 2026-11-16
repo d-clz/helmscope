@@ -1,0 +1,285 @@
+# What `oc get deployment.apps,service,... -n default -o yaml` writes, trimmed.
+apiVersion: v1
+kind: List
+metadata:
+  resourceVersion: ""
+items:
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      meta.helm.sh/release-name: demo
+      meta.helm.sh/release-namespace: default
+    creationTimestamp: "2026-11-02T03:11:09Z"
+    labels:
+      app.kubernetes.io/managed-by: Helm
+      helm.sh/chart: web-0.3.1
+    name: demo-web
+    namespace: default
+    resourceVersion: "918273"
+    uid: 6f1c2f0e-0000-4000-8000-000000000001
+  spec:
+    clusterIP: 172.30.12.40
+    clusterIPs: [172.30.12.40]
+    internalTrafficPolicy: Cluster
+    ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+    selector:
+      app.kubernetes.io/instance: demo
+      app.kubernetes.io/name: web
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: demo-web-metrics
+    namespace: default
+  spec:
+    ports:
+    - name: metrics
+      port: 9090
+      protocol: TCP
+      targetPort: metrics
+    selector:
+      app.kubernetes.io/name: web-metrics
+    type: ClusterIP
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: demo-redis
+    namespace: default
+  spec:
+    clusterIP: None
+    ports:
+    - name: redis
+      port: 6379
+      protocol: TCP
+      targetPort: redis
+    selector:
+      app.kubernetes.io/name: redis
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "7"
+    generation: 9
+    labels:
+      app.kubernetes.io/instance: demo
+      app.kubernetes.io/name: web
+      helm.sh/chart: web-0.3.1
+    name: demo-web
+    namespace: default
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 3
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/instance: demo
+        app.kubernetes.io/name: web
+    strategy:
+      rollingUpdate: {maxSurge: 25%, maxUnavailable: 25%}
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/instance: demo
+          app.kubernetes.io/name: web
+      spec:
+        containers:
+        - env:
+          - name: JAVA_OPTS
+            value: -Xmx768m
+          envFrom:
+          - configMapRef:
+              name: demo-web-env
+          - secretRef:
+              name: web-db-credentials
+          image: nexus.tpb.vn:5000/web:1.4.1
+          imagePullPolicy: IfNotPresent
+          name: web
+          ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "0.5"
+              memory: 256Mi
+            requests:
+              cpu: 250m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        - image: nexus.tpb.vn:5000/exporter:0.9
+          imagePullPolicy: IfNotPresent
+          name: metrics
+          ports:
+          - containerPort: 9100
+            name: metrics
+            protocol: TCP
+        dnsPolicy: ClusterFirst
+        initContainers:
+        - image: nexus.tpb.vn:5000/web:1.4.0
+          name: migrate
+          resources:
+            limits: {cpu: 500m, memory: 512Mi}
+            requests: {cpu: 100m, memory: 512Mi}
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: demo-web
+        serviceAccountName: demo-web
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 3
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    name: demo-web-6d9f7c8b5
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: demo-web
+- apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: demo-web
+    namespace: default
+  spec:
+    maxReplicas: 5
+    minReplicas: 2
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: demo-web
+- apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: demo-web
+    namespace: default
+  spec:
+    ingressClassName: nginx
+    rules:
+    - host: web.tpb.vn
+      http:
+        paths:
+        - backend:
+            service:
+              name: demo-web
+              port:
+                number: 80
+          path: /
+          pathType: Prefix
+        - backend:
+            service:
+              name: demo-web
+              port:
+                name: http
+          path: /api
+          pathType: Prefix
+    tls:
+    - hosts:
+      - web.tpb.vn
+      secretName: wildcard-tpb-vn
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: demo-web-admin
+    namespace: default
+  spec:
+    host: admin.web.tpb.vn
+    port:
+      targetPort: http
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: demo-web
+      weight: 100
+    wildcardPolicy: None
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: demo-redis
+    namespace: default
+  spec:
+    podManagementPolicy: OrderedReady
+    replicas: 3
+    serviceName: demo-redis
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: redis
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: redis
+      spec:
+        containers:
+        - image: nexus.tpb.vn:5000/redis:7.2.4
+          name: redis
+          ports:
+          - containerPort: 6379
+            name: redis
+            protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+    volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 8Gi
+        volumeMode: Filesystem
+---
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: kube-root-ca.crt
+    namespace: default
+  data:
+    ca.crt: "-----BEGIN CERTIFICATE-----"
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: demo-web-env
+    namespace: default
+  data:
+    SPRING_PROFILES_ACTIVE: uat
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    annotations:
+      meta.helm.sh/release-name: old-web
+    name: old-web-config
+    namespace: default
+  data:
+    a: "1"
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: builder-dockercfg-x7k2p
+    namespace: default
+  type: kubernetes.io/dockercfg
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: other-ns-config
+    namespace: elsewhere

@@ -1087,7 +1087,256 @@
     return { depth, cycles, missing };
   }
 
+  // ---- compare: rendered manifests vs an exported live snapshot -----------------
+
+  // parseLive reads what `oc get ... -o yaml|json` writes: one or more documents,
+  // each a single object or a List. Several Lists joined with `---` are fine.
+  function parseLive(text) {
+    const docs = [];
+    let error = "";
+    const add = (o, listKind) => {
+      if (!isObj(o)) return;
+      if (Array.isArray(o.items) && /List$/.test(o.kind || "")) {
+        o.items.forEach((x) => add(x, o.kind === "List" ? "" : o.kind.replace(/List$/, "")));
+        return;
+      }
+      const kind = o.kind || listKind;
+      if (!kind) return;
+      const meta = o.metadata || {};
+      docs.push({ index: docs.length, kind, apiVersion: o.apiVersion || "", name: meta.name || "", namespace: meta.namespace || "", obj: o });
+    };
+    try {
+      jsyaml.loadAll(String(text || ""), (o) => add(o));
+    } catch (e) {
+      // keep the documents that do parse
+      docs.length = 0;
+      String(text || "").split(/^---[ \t]*$/m).forEach((chunk) => {
+        try { add(jsyaml.load(chunk)); } catch (e2) { error = error || e2.message; }
+      });
+      docs.forEach((d, i) => (d.index = i));
+    }
+    return { docs, error };
+  }
+
+  const groupOf = (apiVersion) => (String(apiVersion || "").includes("/") ? String(apiVersion).split("/")[0] : "");
+
+  // Fields the API server owns. They never come from the chart.
+  const SERVER_META = new Set(["uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "selfLink", "ownerReferences", "finalizers", "namespace", "deletionTimestamp", "deletionGracePeriodSeconds"]);
+  // Maps where a key the chart doesn't set is drift, not a server default.
+  const EXACT_MAPS = new Set(["data", "binaryData"]);
+  // Lists of objects are matched on the first of these keys that every
+  // rendered item has, with unique values. Otherwise by position.
+  const LIST_KEYS = ["name", "mountPath", "containerPort", "port", "devicePath", "ip", "key", "topologyKey"];
+  // Keys the API server never fills in. Present in live but not in the
+  // render means someone added them (oc set env, oc set volume, a patch).
+  const NO_DEFAULT = new Set(["env", "envFrom", "volumeMounts", "volumes", "args", "command", "nodeSelector", "tolerations", "affinity", "initContainers", "hostAliases"]);
+  const QTY_PATH = /^(resources|limits|requests|hard|capacity|storage|sizeLimit|ephemeral-storage|cpu|memory)$/;
+  const QTY_RE = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?(m|k|Ki|Mi|Gi|Ti|Pi|Ei|M|G|T|P|E|n|u)?$/;
+  // An empty value in the rendered manifest equals "absent": the API server
+  // drops it on write (omitempty).
+  const emptyish = (v) => v === null || v === undefined || v === "" || v === false || (Array.isArray(v) && v.length === 0) || (isObj(v) && Object.keys(v).length === 0);
+  const fmtPath = (p) => p.map((k, i) => (k.startsWith("[") ? k : (i ? "." : "") + (/^[A-Za-z0-9_$-]+$/.test(k) ? k : JSON.stringify(k)))).join("");
+  const b64 = (s) => {
+    const str = String(s);
+    if (typeof Buffer !== "undefined") return Buffer.from(str, "utf8").toString("base64");
+    return btoa(unescape(encodeURIComponent(str)));
+  };
+
+  function sameScalar(a, b, path) {
+    if (a === b) return true;
+    if ((typeof a === "number" || typeof a === "string") && (typeof b === "number" || typeof b === "string")) {
+      if (String(a) === String(b)) return true;
+      if (path.some((k) => QTY_PATH.test(k)) && QTY_RE.test(String(a)) && QTY_RE.test(String(b))) {
+        const x = parseQty(a), y = parseQty(b);
+        return !Number.isNaN(x) && Math.abs(x - y) <= 1e-9 * Math.max(1, Math.abs(x));
+      }
+    }
+    return false;
+  }
+
+  function listKey(want) {
+    if (!want.length || !want.every(isObj)) return "";
+    return LIST_KEYS.find((k) => want.every((x) => x[k] !== undefined && x[k] !== null) && new Set(want.map((x) => String(x[k]))).size === want.length) || "";
+  }
+
+  // diffObject compares the fields the rendered object sets against the live
+  // one. Fields only in live are server defaults and are skipped, except new
+  // keys in ConfigMap/Secret data and new items in keyed lists (an injected
+  // sidecar, an env var added with `oc set env`).
+  // Returns [{path, op: "changed"|"missing"|"extra", want, got}].
+  function diffObject(want, got) {
+    const out = [];
+    const push = (p, op, w, g) => out.push({ path: fmtPath(p), op, want: w, got: g });
+    const walk = (w, g, p) => {
+      if (isObj(w)) {
+        if (!isObj(g)) {
+          if (g === undefined && emptyish(w)) return;
+          return push(p, g === undefined ? "missing" : "changed", w, g);
+        }
+        for (const k of Object.keys(w)) {
+          if (p.length === 0 && k === "status") continue;
+          if (p.length === 1 && p[0] === "metadata" && SERVER_META.has(k)) continue;
+          if (g[k] === undefined) {
+            if (!emptyish(w[k])) push(p.concat(k), "missing", w[k], undefined);
+            continue;
+          }
+          walk(w[k], g[k], p.concat(k));
+        }
+        const exact = p.length === 1 && EXACT_MAPS.has(p[0]);
+        for (const k of Object.keys(g)) {
+          if (w[k] === undefined && (exact || (NO_DEFAULT.has(k) && !emptyish(g[k])))) push(p.concat(k), "extra", undefined, g[k]);
+        }
+        return;
+      }
+      if (Array.isArray(w)) {
+        if (!Array.isArray(g)) {
+          if (g === undefined && emptyish(w)) return;
+          return push(p, g === undefined ? "missing" : "changed", w, g);
+        }
+        const key = listKey(w);
+        if (key) {
+          const gi = new Map(g.filter(isObj).map((x) => [String(x[key]), x]));
+          w.forEach((x) => {
+            const id = String(x[key]);
+            const seg = `[${key}=${id}]`;
+            if (!gi.has(id)) push(p.concat(seg), "missing", x, undefined);
+            else walk(x, gi.get(id), p.concat(seg));
+            gi.delete(id);
+          });
+          gi.forEach((x, id) => push(p.concat(`[${key}=${id}]`), "extra", undefined, x));
+          return;
+        }
+        if (w.every((x) => !isObj(x) && !Array.isArray(x))) {
+          if (w.length !== g.length || w.some((x, i) => !sameScalar(x, g[i], p))) push(p, "changed", w, g);
+          return;
+        }
+        w.forEach((x, i) => (i < g.length ? walk(x, g[i], p.concat(`[${i}]`)) : push(p.concat(`[${i}]`), "missing", x, undefined)));
+        for (let i = w.length; i < g.length; i++) push(p.concat(`[${i}]`), "extra", undefined, g[i]);
+        return;
+      }
+      if (g === undefined) {
+        if (!emptyish(w)) push(p, "missing", w, undefined);
+        return;
+      }
+      if (!sameScalar(w, g, p)) push(p, "changed", w, g);
+    };
+    walk(want, got, []);
+    return out;
+  }
+
+  // Secrets: the API server folds stringData into base64 data.
+  function desiredForCompare(obj) {
+    if (!obj || obj.kind !== "Secret" || !isObj(obj.stringData)) return obj;
+    const o = Object.assign({}, obj, { data: Object.assign({}, obj.data || {}) });
+    Object.entries(obj.stringData).forEach(([k, v]) => (o.data[k] = b64(v == null ? "" : v)));
+    delete o.stringData;
+    return o;
+  }
+
+  const OS_DEFAULT_SA = new Set(["default", "builder", "deployer", "pipeline"]);
+  const DEFAULT_CM = new Set(["kube-root-ca.crt", "openshift-service-ca.crt"]);
+  const INJECTED = /-(dockercfg|token)-[a-z0-9]{5}$/;
+  const NEVER_EXTRA = new Set(["Event", "Pod", "ReplicaSet", "ControllerRevision", "Endpoints", "EndpointSlice", "Build", "ReplicationController", "Lease", "PodMetrics"]);
+
+  // skipReason says why a live object that no render produced is not worth
+  // listing: the cluster or a controller made it.
+  function skipReason(l) {
+    const o = l.obj || {};
+    const m = o.metadata || {};
+    if ((m.ownerReferences || []).length) return "owned by " + m.ownerReferences[0].kind;
+    if (NEVER_EXTRA.has(l.kind)) return "runtime object";
+    if (l.kind === "ServiceAccount" && OS_DEFAULT_SA.has(l.name)) return "namespace default";
+    if (l.kind === "ConfigMap" && DEFAULT_CM.has(l.name)) return "namespace default";
+    if (l.kind === "Secret" && (/service-account-token|dockercfg/.test(o.type || "") || INJECTED.test(l.name))) return "service account secret";
+    if (/^(RoleBinding|Role)$/.test(l.kind) && /^system:/.test(l.name)) return "namespace default";
+    if (l.kind === "Secret" && /^sh\.helm\.release\.v1\./.test(l.name)) return "helm release record";
+    return "";
+  }
+
+  // OpenShift adds the SA's dockercfg secrets to its secrets/imagePullSecrets.
+  const isInjectedDiff = (kind, d) => kind === "ServiceAccount" && d.op === "extra" && /^(secrets|imagePullSecrets)\[/.test(d.path) && INJECTED.test(String((d.got && d.got.name) || ""));
+
+  // compareSets matches rendered docs to live docs on kind/namespace/name and
+  // diffs each pair. desired docs may carry .release (combined helmfile view).
+  // Results: {items, extras, skipped, namespaces, counts}.
+  function compareSets(desired, live, defaultNs) {
+    const nsOf = (d) => nsOfDoc(d, defaultNs);
+    const liveNs = (l) => (CLUSTER_SCOPED.has(l.kind) ? "" : l.namespace);
+    const idx = new Map();
+    const byName = new Map();
+    live.forEach((l) => {
+      idx.set(`${l.kind}/${liveNs(l)}/${l.name}`, l);
+      const k = `${l.kind}/${l.name}`;
+      byName.set(k, (byName.get(k) || []).concat(l));
+    });
+    const used = new Set();
+    const D = desired.filter((d) => d.obj && d.kind && d.name);
+    const hpaTargets = new Set(D.filter((d) => d.kind === "HorizontalPodAutoscaler").map((h) => {
+      const t = get(h.obj, ["spec", "scaleTargetRef"]) || {};
+      return `${t.kind}/${nsOf(h)}/${t.name}`;
+    }));
+    const items = D.map((d) => {
+      const ns = nsOf(d);
+      const key = `${d.kind}/${ns}/${d.name}`;
+      let l = idx.get(key);
+      if (!l) {
+        // an export without namespaces still matches when the name is unique
+        const c = (byName.get(`${d.kind}/${d.name}`) || []).filter((x) => !x.namespace);
+        if (c.length === 1) l = c[0];
+      }
+      const base = { key, kind: d.kind, name: d.name, ns, doc: d.index, release: d.release || "", hook: d.hook || "" };
+      if (!l) return Object.assign(base, { status: d.hook ? "hook" : "missing", diffs: [] });
+      used.add(l);
+      const diffs = diffObject(desiredForCompare(d.obj), l.obj)
+        .filter((x) => !isInjectedDiff(d.kind, x))
+        .map((x) => {
+          if (x.path === "spec.replicas" && hpaTargets.has(key)) x.note = "an HPA scales this";
+          else if (d.kind === "DeploymentConfig" && /\.image$/.test(x.path)) x.note = "image triggers rewrite this";
+          else if (x.path === "apiVersion") x.note = "oc get returns the server's preferred version";
+          return x;
+        });
+      const real = diffs.filter((x) => !x.note).length;
+      return Object.assign(base, { status: real ? "drift" : "match", diffs, live: l.index });
+    });
+    const namespaces = new Set(items.map((i) => i.ns).filter(Boolean));
+    const extras = [], skipped = [];
+    live.forEach((l) => {
+      if (used.has(l)) return;
+      const ns = liveNs(l);
+      if (ns && !namespaces.has(ns)) return; // not a namespace the render touches
+      if (!ns && !items.some((i) => !i.ns)) return;
+      const why = skipReason(l);
+      const ann = get(l.obj, ["metadata", "annotations"]) || {};
+      const e = { key: `${l.kind}/${ns}/${l.name}`, kind: l.kind, name: l.name, ns, live: l.index, helmRelease: ann["meta.helm.sh/release-name"] || "" };
+      if (why) skipped.push(Object.assign(e, { why }));
+      else extras.push(Object.assign(e, { status: "extra", diffs: [] }));
+    });
+    const counts = { match: 0, drift: 0, missing: 0, hook: 0, extra: extras.length };
+    items.forEach((i) => counts[i.status]++);
+    return { items, extras, skipped, namespaces: [...namespaces].sort(), counts };
+  }
+
+  // exportCommand writes the oc command that captures exactly the kinds and
+  // namespaces the render produced.
+  function exportCommand(desired, defaultNs, cli) {
+    cli = cli || "oc";
+    const D = desired.filter((d) => d.obj && d.kind);
+    const res = (d) => d.kind.toLowerCase() + (groupOf(d.apiVersion) ? "." + groupOf(d.apiVersion) : "");
+    const nsKinds = [...new Set(D.filter((d) => !CLUSTER_SCOPED.has(d.kind)).map(res))].sort();
+    const clKinds = [...new Set(D.filter((d) => CLUSTER_SCOPED.has(d.kind)).map(res))].sort();
+    const nss = [...new Set(D.filter((d) => !CLUSTER_SCOPED.has(d.kind)).map((d) => nsOfDoc(d, defaultNs)))].sort();
+    const lines = [];
+    if (nsKinds.length && nss.length === 1) lines.push(`${cli} get ${nsKinds.join(",")} -n ${nss[0]} -o yaml > live-${nss[0]}.yaml`);
+    else if (nsKinds.length) lines.push(`for ns in ${nss.join(" ")}; do ${cli} get ${nsKinds.join(",")} -n "$ns" -o yaml; echo ---; done > live.yaml`);
+    if (clKinds.length) {
+      const names = [...new Set(D.filter((d) => CLUSTER_SCOPED.has(d.kind)).map((d) => `${res(d)}/${d.name}`))].sort();
+      lines.push(`${cli} get ${names.join(" ")} -o yaml > live-cluster.yaml`);
+    }
+    return lines.join("\n");
+  }
+
   return {
+    parseLive, diffObject, compareSets, exportCommand,
     splitManifest, fold, dump, podSpecOf,
     parseQty, fmtCpu, fmtBytes, fmtRes, podRes, buildMap, buildTopology,
     suggestQuota, describe, categoryOf, CATEGORIES,

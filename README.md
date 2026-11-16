@@ -36,9 +36,16 @@ Point it at a folder of charts or helmfiles and it shows:
   Service → pod links cover a whole namespace, not one release. A single
   release's Map shows its own share and links to the namespace view for the
   quota. `installed: false` releases are left out.
+- **Compare** with what is running: load an `oc get … -o yaml` export and
+  every rendered object is matched on kind, namespace and name and marked
+  drift, missing, extra (in the export, no render made it), hook or match.
+  Available for a chart, a single release, and the whole inventory filter.
+  The tab shows the exact `oc get` command for the kinds and namespaces the
+  render produces.
 
 It never talks to a cluster. It runs your own `helm` and `helmfile` binaries,
-so the output is exactly what they produce.
+so the output is exactly what they produce. Compare works on a file you
+export yourself.
 
 ## Run
 
@@ -107,6 +114,21 @@ The exact command line is shown in the toolbar and the Log tab.
 - **Topology uses the rendered YAML only.** Service → workload comes from
   selector labels against pod template labels. Ports are resolved by name or
   number. Anything referenced but not rendered shows as a dashed node.
+- **Compare only checks fields the chart sets.** Anything only in the live
+  object is a server default and is skipped (`clusterIP`, `protocol: TCP`,
+  `terminationMessagePath`, `status`, `managedFields` …), except new keys in
+  ConfigMap/Secret `data`, new items in named lists (an injected sidecar, an
+  extra env var), and keys the server never fills in (`env`, `volumes`,
+  `args`, `nodeSelector`, `tolerations` …) — those count as drift. Lists are
+  matched by `name` (or `mountPath`, `containerPort`, `port`) rather than
+  position; quantities compare by value (`500m` = `0.5`, `1Gi` = `1024Mi`);
+  Secret `stringData` is compared as base64 `data`. `spec.replicas` under an
+  HPA, `apiVersion`, and DeploymentConfig images set by image triggers are
+  shown as notes, not drift. Extras skip objects with an owner, namespace
+  defaults (`default`/`builder`/`deployer` SAs, `kube-root-ca.crt`), service
+  account secrets and Helm release records. The export stays in the browser
+  tab's memory: it is never sent to the server or stored, and it may hold
+  Secret data, so treat the file accordingly.
 - **Secrets from `helm-secrets`/sops** are whatever helmfile renders. Use it on
   environments where that's acceptable, or render without the secrets layer.
 

@@ -43,6 +43,11 @@
     pickedDoc: -1, pickedLine: -1,
     auto: store.get("auto", true),
     form: { release: "demo", namespace: "default", kubeVersion: "" },
+    live: null,           // exported cluster snapshot: { name, docs, error }. Memory only: it may hold Secrets.
+    livePaste: false,
+    cmpShow: store.get("cmpShow", ["drift", "missing", "extra"]),
+    cmpQ: "",
+    cmpOpen: new Set(),
   };
 
   async function api(path, body) {
@@ -210,6 +215,7 @@
       ["map", "Map", nWork || ""],
       ["topology", "Topology", nIss ? `${nIss}!` : ""],
       ["values", "Values", rows.total],
+      ["compare", "Compare", cmpBadge(S.docs, currentNs())],
       ["output", "Output", ""],
       ["log", "Log", S.errors.length || ""],
     ];
@@ -230,6 +236,7 @@
       case "map": return mapHTML(topo);
       case "topology": return topologyHTML(topo);
       case "values": return valuesHTML(rows);
+      case "compare": return compareHTML(S.docs, currentNs());
       case "output": return `<pre class="code" style="padding:10px">${esc(S.res ? S.res.stdout : "")}</pre>`;
       case "log": return logHTML();
     }
@@ -590,10 +597,22 @@
     }
   }
 
-  document.addEventListener("toggle", (e) => { if (e.target.id === "res-panel") store.set("resOpen", e.target.open); }, true);
+  document.addEventListener("toggle", (e) => {
+    if (e.target.id === "res-panel") store.set("resOpen", e.target.open);
+    if (e.target.classList && e.target.classList.contains("cmp-o")) {
+      if (e.target.open) S.cmpOpen.add(e.target.dataset.key); else S.cmpOpen.delete(e.target.dataset.key);
+    }
+  }, true);
+  document.addEventListener("dragover", (e) => { if (e.target.closest && e.target.closest(".cmp")) e.preventDefault(); });
+  document.addEventListener("drop", (e) => {
+    if (!e.target.closest || !e.target.closest(".cmp")) return;
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files.length) loadLiveFiles(e.dataTransfer.files);
+  });
 
   function copyText(text, btn) {
-    const done = (ok) => { btn.textContent = ok ? "Copied" : "Select and copy"; setTimeout(() => (btn.textContent = "Copy YAML"), 1500); };
+    const label = btn.dataset.label || (btn.dataset.label = btn.textContent);
+    const done = (ok) => { btn.textContent = ok ? "Copied" : "Select and copy"; setTimeout(() => (btn.textContent = label), 1500); };
     try {
       navigator.clipboard.writeText(text).then(() => done(true), () => done(selectPre(btn)));
     } catch (e) { done(selectPre(btn)); }
@@ -663,6 +682,30 @@
       }
       case "ns-all": return setNsHide([]);
       case "inv-tab": S.invTab = t.dataset.tab; return drawMain();
+      case "live-paste": S.livePaste = !S.livePaste; return redrawCmp();
+      case "live-use": {
+        const ta = $("#live-text");
+        setLive("pasted", ta ? ta.value : "");
+        S.livePaste = false;
+        return redrawCmp();
+      }
+      case "live-clear": S.live = null; S.cmpOpen.clear(); return redrawCmp();
+      case "cmp-show": {
+        const k = t.dataset.st;
+        S.cmpShow = S.cmpShow.includes(k) ? S.cmpShow.filter((x) => x !== k) : S.cmpShow.concat(k);
+        store.set("cmpShow", S.cmpShow);
+        return redrawCmp();
+      }
+      case "cmp-expand": {
+        const open = t.dataset.open === "1";
+        document.querySelectorAll("details.cmp-o").forEach((d) => (d.open = open));
+        return;
+      }
+      case "copy-cmd": return copyText(t.dataset.cmd || "", t);
+      case "cmp-ns-live": {
+        const have = new Set(S.live ? S.live.docs.map((d) => d.namespace).filter(Boolean) : []);
+        return setNsHide(HS.groupByNamespace(S.hf.releases).map((g) => g.ns).filter((n) => !have.has(n)));
+      }
       case "comb-refresh":
         visibleReleases().forEach((r) => S.relCache.delete(relKey(r)));
         return drawMain();
@@ -731,6 +774,14 @@
       case "headroom": S.headroom = Math.max(0, parseInt(v, 10) || 0); store.set("headroom", S.headroom); return redrawKeepScroll();
       case "ds-nodes": S.dsNodes = Math.max(1, parseInt(v, 10) || 1); store.set("dsNodes", S.dsNodes); return redrawKeepScroll();
       case "src-file": return openSrc(v, []);
+      case "live-file": if (e.target.files && e.target.files.length) loadLiveFiles(e.target.files); return;
+      case "cmp-q": {
+        S.cmpQ = v;
+        drawMain();
+        const el = $("#cmp-q");
+        if (el) { el.focus(); el.setSelectionRange(v.length, v.length); }
+        return;
+      }
       case "doc-filter": case "val-filter": {
         if (id === "doc-filter") S.docFilter = v; else S.valFilter = v;
         drawMain();
@@ -948,7 +999,7 @@
           <span class="grow"></span>
           <label class="ctl"><input type="checkbox" id="inv-group" ${grouped ? "checked" : ""}> group by namespace</label>
         </div>
-        <div class="tabs inv-tabs">${[["releases", "Releases"], ["map", "Map"], ["topology", "Topology"]].map(([k, l]) => `<button data-action="inv-tab" data-tab="${k}" class="${S.invTab === k ? "on" : ""}">${l}</button>`).join("")}
+        <div class="tabs inv-tabs">${[["releases", "Releases"], ["map", "Map"], ["topology", "Topology"], ["compare", "Compare"]].map(([k, l]) => `<button data-action="inv-tab" data-tab="${k}" class="${S.invTab === k ? "on" : ""}">${l}</button>`).join("")}
           <span class="muted small">${S.invTab === "releases" ? "" : `all ${plural(R.filter((r) => r.installed).length, "release")} in the filter, rendered together`}</span></div>
         ${S.invTab !== "releases" ? combinedHTML() : `
         <div class="card"><h3>Releases <span class="muted">(${R.length === ALL.length ? ALL.length : `${R.length} of ${ALL.length}`})</span></h3>
@@ -960,6 +1011,115 @@
           ${missing.length ? `<div class="errbar">Missing needs: ${missing.map((m) => `${esc(m.from)} → ${esc(m.to)}`).join(", ")}</div>` : ""}
           <div class="graph-wrap">${R.length ? invGraphHTML(R, depth) : `<p class="muted">No releases match the filter.</p>`}</div></div>`}
       </div>`;
+  }
+
+  // ---- compare: rendered manifests vs an exported live snapshot ------------------
+
+  function setLive(name, text) {
+    const p = HS.parseLive(text);
+    S.live = { name, docs: p.docs, error: p.error };
+    S.cmpOpen.clear();
+  }
+
+  async function loadLiveFiles(files) {
+    const list = [...files];
+    const texts = await Promise.all(list.map((f) => f.text()));
+    setLive(list.map((f) => f.name).join(", "), texts.join("\n---\n"));
+    redrawCmp();
+  }
+
+  function redrawCmp() {
+    if (S.mode === "helmfile" && !S.release) return redrawInventory();
+    return redrawKeepScroll();
+  }
+
+  function cmpBadge(docs, ns) {
+    if (!S.live || !docs.length) return "";
+    const c = HS.compareSets(docs, S.live.docs, ns).counts;
+    const n = c.drift + c.missing + c.extra;
+    return n ? `${n}!` : "✓";
+  }
+
+  const CMP_ST = [
+    ["drift", "drift", "Differs from the render"],
+    ["missing", "missing", "Rendered but not in the export"],
+    ["extra", "extra", "In the export, no render produced it"],
+    ["hook", "hook", "Helm hook, not kept after it runs"],
+    ["match", "match", "Same as the render"],
+  ];
+  const CMP_ORDER = { drift: 0, missing: 1, extra: 2, hook: 3, match: 4 };
+
+  function cmpVal(v) {
+    if (v === undefined) return `<span class="muted">absent</span>`;
+    if (v !== null && typeof v === "object") return `<pre>${esc(HS.dump(v).replace(/\n$/, ""))}</pre>`;
+    return `<code>${esc(typeof v === "string" ? v : JSON.stringify(v))}</code>`;
+  }
+
+  function liveYaml(o) {
+    const c = JSON.parse(JSON.stringify(o || {}));
+    delete c.status;
+    if (c.metadata) ["managedFields", "uid", "resourceVersion", "creationTimestamp", "generation", "selfLink"].forEach((k) => delete c.metadata[k]);
+    return HS.dump(c);
+  }
+
+  function compareHTML(docs, defaultNs) {
+    const cmd = HS.exportCommand(docs, defaultNs);
+    const cmdBox = (open) => `<details class="suggest cmp-cmd" ${open ? "open" : ""}><summary class="sub">Export command for what this render produces</summary>
+      <div class="cmd-row"><pre class="yaml-out">${esc(cmd || "# nothing rendered yet")}</pre><button class="btn sm" data-action="copy-cmd" data-cmd="${esc(cmd)}">Copy</button></div>
+      <p class="muted small">Add <code>--insecure-skip-tls-verify</code> or <code>--context</code> as your shell needs. The export includes Secret data; it stays in this tab's memory and is never sent to the helmscope server or stored.</p></details>`;
+    const loader = `<div class="cmp-load">
+        <label class="btn sm">Load export…<input type="file" id="live-file" multiple accept=".yaml,.yml,.json,.txt" hidden></label>
+        <button class="btn sm ${S.livePaste ? "on" : ""}" data-action="live-paste">Paste</button>
+        ${S.live ? `<span class="muted small" title="${esc(S.live.name)}">${esc(S.live.name.length > 60 ? S.live.name.slice(0, 57) + "…" : S.live.name)} · ${plural(S.live.docs.length, "object")}</span> <span class="link small" data-action="live-clear">clear</span>` : `<span class="muted small">or drop .yaml / .json files here</span>`}
+      </div>
+      ${S.livePaste ? `<div class="cmp-paste"><textarea id="live-text" spellcheck="false" placeholder="paste oc get … -o yaml output"></textarea><button class="btn sm primary" data-action="live-use">Compare</button></div>` : ""}
+      ${S.live && S.live.error ? `<div class="errbar">Some of the export did not parse: ${esc(S.live.error)}</div>` : ""}`;
+    if (!S.live) {
+      return `<div class="cmp">${loader}${cmdBox(true)}
+        <div class="empty"><h2>Compare with the cluster</h2>
+        <p>Run the export command against the cluster, then load the file. Each rendered object is matched on kind, namespace and name.
+        Only fields the chart sets are compared, so server defaults and <code>status</code> don't show up as drift.</p></div></div>`;
+    }
+    if (!docs.length) return `<div class="cmp">${loader}<div class="empty">Nothing rendered yet.</div></div>`;
+    const r = HS.compareSets(docs, S.live.docs, defaultNs);
+    const all = r.items.concat(r.extras).sort((a, b) => CMP_ORDER[a.status] - CMP_ORDER[b.status] || a.ns.localeCompare(b.ns) || a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+    const q = S.cmpQ.trim().toLowerCase();
+    const shown = all.filter((i) => S.cmpShow.includes(i.status) && (!q || `${i.kind} ${i.name} ${i.ns} ${i.release || ""}`.toLowerCase().includes(q) || i.diffs.some((d) => d.path.toLowerCase().includes(q))));
+    const chips = CMP_ST.map(([k, l, tip]) => `<button class="fchip ${S.cmpShow.includes(k) ? "on" : ""}" data-action="cmp-show" data-st="${k}" title="${tip}"><span class="sw st-${k}"></span>${l} <span class="muted">${r.counts[k]}</span></button>`).join("");
+    const nLiveNs = new Set(S.live.docs.map((d) => d.namespace).filter(Boolean));
+    const nsMiss = r.namespaces.filter((n) => !nLiveNs.has(n));
+    const inInv = S.mode === "helmfile" && !S.release;
+    const warn = nsMiss.length ? `<div class="note warn">The export has nothing in ${nsMiss.map((n) => `<code>${esc(n)}</code>`).join(", ")}. Everything there shows as missing; export ${nsMiss.length === 1 ? "that namespace" : "those namespaces"} too${inInv ? ` or <span class="link" data-action="cmp-ns-live">compare only the exported namespaces</span>` : ""}.</div>` : "";
+    const row = (i) => {
+      const real = i.diffs.filter((d) => !d.note);
+      const notes = i.diffs.length - real.length;
+      const sum = i.status === "drift" ? plural(real.length, "difference") + (notes ? ` · ${plural(notes, "note")}` : "")
+        : i.status === "match" ? (notes ? plural(notes, "note") : "")
+        : i.status === "extra" ? (i.helmRelease ? `helm release ${esc(i.helmRelease)}` : "")
+        : "";
+      let body = "";
+      if (i.status === "missing") body = `<p class="muted">Not in the export: not deployed yet, deleted, or the export did not include this kind or namespace.</p>`;
+      if (i.status === "hook") body = `<p class="muted">Helm hook (<code>${esc(i.hook)}</code>). Helm deletes hook objects after they run unless the hook delete policy keeps them, so absence is normal.</p>`;
+      if (i.status === "extra") body = `<p class="muted">${i.helmRelease ? `Annotated as Helm release <b>${esc(i.helmRelease)}</b>, which is not in this render: a release filtered out, renamed or left behind.` : "No rendered release produces this object. Created by hand, by another tool, or referenced by the chart but managed elsewhere."}</p>
+        <pre class="yaml-out">${esc(liveYaml(S.live.docs[i.live] && S.live.docs[i.live].obj))}</pre>`;
+      if (i.diffs.length) body += `<table class="rt cmp-d"><thead><tr><th>Path</th><th></th><th>Rendered</th><th>Live</th></tr></thead><tbody>
+        ${i.diffs.map((d) => `<tr class="${d.note ? "noted" : ""}"><td class="mono">${esc(d.path)}${d.note ? `<div class="muted small">${esc(d.note)}</div>` : ""}</td><td><span class="op op-${d.op}">${d.op}</span></td><td>${cmpVal(d.want)}</td><td>${cmpVal(d.got)}</td></tr>`).join("")}</tbody></table>`;
+      if (i.status === "match" && !i.diffs.length) body = `<p class="muted">Every field the render sets matches.</p>`;
+      const jump = i.doc !== undefined ? `<span class="link small" data-action="jump-doc" data-doc="${i.doc}">open rendered manifest</span>` : "";
+      return `<details class="cmp-o" data-key="${esc(i.status + ":" + i.key)}" ${S.cmpOpen.has(i.status + ":" + i.key) ? "open" : ""}>
+        <summary><span class="st st-${i.status}">${i.status}</span><b>${esc(i.kind)}</b> <span class="mono">${esc(i.name)}</span>
+          <span class="muted small">${esc(i.ns || "cluster")}</span>${i.release ? `<span class="tag rel">${esc(i.release)}</span>` : ""}
+          <span class="grow"></span><span class="muted small">${sum}</span></summary>
+        <div class="cmp-b">${jump}${body}</div></details>`;
+    };
+    return `<div class="cmp">${loader}
+      <div class="cmp-bar">${chips}<input id="cmp-q" placeholder="filter kind, name or path" value="${esc(S.cmpQ)}" style="width:190px">
+        <span class="grow"></span><span class="link small" data-action="cmp-expand" data-open="1">expand all</span><span class="link small" data-action="cmp-expand" data-open="0">collapse all</span></div>
+      ${warn}
+      <div class="cmp-list">${shown.length ? shown.map(row).join("") : `<div class="empty">${all.length ? "Nothing matches the filter." : "No objects to compare."}</div>`}</div>
+      ${r.skipped.length ? `<details class="cmp-skip"><summary class="muted small">${plural(r.skipped.length, "live object")} left out as cluster-made</summary>
+        <div class="muted small mono">${r.skipped.map((x) => `${esc(x.kind)}/${esc(x.name)} <span>(${esc(x.why)})</span>`).join("<br>")}</div></details>` : ""}
+      ${cmdBox(false)}</div>`;
   }
 
   // ---- combined render: every release in the filter, merged ---------------------
@@ -1048,6 +1208,7 @@
     if (!R.length) return head + `<div class="empty">No releases match the filter.</div>`;
     if (!c.docs.length) return head + `<div class="empty">${c.pending.length ? "Rendering releases…" : "The releases rendered no manifests."}</div>`;
     const topo = HS.buildTopology(c.docs, "default", { nodes: S.dsNodes });
+    if (S.invTab === "compare") return head + (c.pending.length ? `<p class="muted small">${plural(c.pending.length, "release")} still rendering; the comparison fills in as they finish.</p>` : "") + compareHTML(c.docs, "default");
     return head + (S.invTab === "map" ? mapHTML(topo, c.docs, "default", { quota: true }) : `<div class="comb-topo">${topologyHTML(topo)}</div>`);
   }
 
