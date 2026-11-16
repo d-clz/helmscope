@@ -31,6 +31,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/helmfile/build", s.handleHelmfileBuild)
 	mux.HandleFunc("POST /api/helmfile/template", s.handleHelmfileTemplate)
 	mux.HandleFunc("POST /api/helmfile/chart", s.handleHelmfileChart)
+	mux.HandleFunc("POST /api/live", s.handleLive)
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -157,6 +158,7 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"helmOK":      hv.OK,
 		"helmfile":    strings.TrimSpace(firstNonEmpty(hfv.Stdout, hfv.Stderr)),
 		"helmfileOK":  hfv.OK,
+		"live":        s.cfg.Live,
 	})
 }
 

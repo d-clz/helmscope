@@ -430,6 +430,12 @@ t("exportCommand", () => {
     .concat([{ kind: "ClusterRole", apiVersion: "rbac.authorization.k8s.io/v1", name: "r", obj: {} }]);
   assert.strictEqual(HS.exportCommand(multi, "x", "kubectl"),
     'for ns in a b; do kubectl get service -n "$ns" -o yaml; echo ---; done > live.yaml\nkubectl get clusterrole.rbac.authorization.k8s.io/r -o yaml > live-cluster.yaml');
+  // -live template: write where helmscope will look
+  assert.strictEqual(HS.exportCommand(multi, "x", "oc", { tpl: "~/exports/{env}/{ns}.yaml", env: "uat" }),
+    'for ns in a b; do f="$HOME/exports/uat/$ns.yaml"; mkdir -p "$(dirname "$f")"; oc get service -n "$ns" -o yaml > "$f"; done\noc get clusterrole.rbac.authorization.k8s.io/r -o yaml > "$HOME/exports/uat/live-cluster.yaml"');
+  assert.strictEqual(HS.exportCommand(desired.slice(0, 1), "apps", "oc", { tpl: "/data/live/{env}/", env: "prod" }),
+    'mkdir -p "$(dirname "/data/live/prod/live.yaml")"; oc get service -n apps -o yaml > "/data/live/prod/live.yaml"');
+  assert.deepStrictEqual(HS.renderNamespaces(multi, "x"), ["a", "b"]);
 });
 
 console.log(`\n${n} passed`);

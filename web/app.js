@@ -45,6 +45,7 @@
     form: { release: "demo", namespace: "default", kubeVersion: "" },
     live: null,           // exported cluster snapshot: { name, docs, error }. Memory only: it may hold Secrets.
     livePaste: false,
+    liveAuto: { key: "" }, // -live template fetch: { key, loading, files, missing, ref, error }
     cmpShow: store.get("cmpShow", ["drift", "missing", "extra"]),
     cmpQ: "",
     cmpOpen: new Set(),
@@ -690,6 +691,10 @@
         return redrawCmp();
       }
       case "live-clear": S.live = null; S.cmpOpen.clear(); return redrawCmp();
+      case "live-reload": case "live-auto":
+        if (a === "live-auto" || (S.live && S.live.source === "auto")) S.live = null;
+        S.liveAuto = { key: "" };
+        return redrawCmp();
       case "cmp-show": {
         const k = t.dataset.st;
         S.cmpShow = S.cmpShow.includes(k) ? S.cmpShow.filter((x) => x !== k) : S.cmpShow.concat(k);
@@ -1015,10 +1020,35 @@
 
   // ---- compare: rendered manifests vs an exported live snapshot ------------------
 
-  function setLive(name, text) {
+  function setLive(name, text, source) {
     const p = HS.parseLive(text);
-    S.live = { name, docs: p.docs, error: p.error };
+    S.live = { name, docs: p.docs, error: p.error, source: source || "manual" };
     S.cmpOpen.clear();
+  }
+
+  const liveTpl = () => (S.info && S.info.live) || "";
+  const baseName = (p) => String(p).split(/[\\/]/).pop();
+
+  // ensureLiveAuto loads the -live files for this environment and these
+  // namespaces once per combination; "reload" clears the key.
+  function ensureLiveAuto(nss) {
+    const key = S.hfEnv + "|" + nss.join(",");
+    if (S.liveAuto.key === key) return;
+    S.liveAuto = { key, loading: true };
+    api("live", { env: S.hfEnv, namespaces: nss }).then((r) => {
+      if (S.liveAuto.key !== key) return;
+      S.liveAuto = { key, files: r.files, missing: r.missing, ref: r.ref };
+      if (!S.live || S.live.source === "auto") {
+        if (r.files.length) setLive(r.files.map((f) => baseName(f.path)).join(", "), r.text, "auto");
+        else S.live = null;
+      }
+      redrawCmp();
+    }, (e) => {
+      if (S.liveAuto.key !== key) return;
+      S.liveAuto = { key, error: e.message, files: [], missing: [] };
+      if (S.live && S.live.source === "auto") S.live = null;
+      redrawCmp();
+    });
   }
 
   async function loadLiveFiles(files) {
@@ -1062,19 +1092,31 @@
     return HS.dump(c);
   }
 
-  function compareHTML(docs, defaultNs) {
-    const cmd = HS.exportCommand(docs, defaultNs);
+  function compareHTML(docs, defaultNs, nsList) {
+    const tpl = liveTpl();
+    const auto = tpl && (!S.live || S.live.source === "auto");
+    const nss = nsList || HS.renderNamespaces(docs, defaultNs);
+    if (auto && docs.length) ensureLiveAuto(nss);
+    const A = S.liveAuto;
+    const cmd = HS.exportCommand(docs, defaultNs, "oc", tpl ? { tpl, env: S.hfEnv } : null);
     const cmdBox = (open) => `<details class="suggest cmp-cmd" ${open ? "open" : ""}><summary class="sub">Export command for what this render produces</summary>
       <div class="cmd-row"><pre class="yaml-out">${esc(cmd || "# nothing rendered yet")}</pre><button class="btn sm" data-action="copy-cmd" data-cmd="${esc(cmd)}">Copy</button></div>
       <p class="muted small">Add <code>--insecure-skip-tls-verify</code> or <code>--context</code> as your shell needs. The export includes Secret data; it stays in this tab's memory and is never sent to the helmscope server or stored.</p></details>`;
     const loader = `<div class="cmp-load">
         <label class="btn sm">Load export…<input type="file" id="live-file" multiple accept=".yaml,.yml,.json,.txt" hidden></label>
         <button class="btn sm ${S.livePaste ? "on" : ""}" data-action="live-paste">Paste</button>
-        ${S.live ? `<span class="muted small" title="${esc(S.live.name)}">${esc(S.live.name.length > 60 ? S.live.name.slice(0, 57) + "…" : S.live.name)} · ${plural(S.live.docs.length, "object")}</span> <span class="link small" data-action="live-clear">clear</span>` : `<span class="muted small">or drop .yaml / .json files here</span>`}
+        ${auto
+          ? `<span class="muted small" title="${esc((A.files || []).map((f) => f.path).join("\n"))}">-live <code>${esc(tpl)}</code> · env <b>${esc(S.hfEnv)}</b>${A.loading ? ` · <span class="spin"></span> loading` : A.files ? ` → ${A.files.length ? esc(A.files.map((f) => baseName(f.path)).join(", ")) + (S.live ? ` · ${plural(S.live.docs.length, "object")}` : "") : "no files yet"}` : ""}</span>
+             <span class="link small" data-action="live-reload" title="Read the files again after a new export">reload</span>`
+          : S.live ? `<span class="muted small" title="${esc(S.live.name)}">${esc(S.live.name.length > 60 ? S.live.name.slice(0, 57) + "…" : S.live.name)} · ${plural(S.live.docs.length, "object")}</span> <span class="link small" data-action="live-clear">clear</span>${tpl ? ` <span class="link small" data-action="live-auto">use -live files</span>` : ""}`
+          : `<span class="muted small">or drop .yaml / .json files here</span>`}
       </div>
+      ${auto && A.error ? `<div class="errbar">-live: ${esc(A.error)}</div>` : ""}
+      ${auto && A.missing && A.missing.length ? `<div class="note warn">Not found: ${A.missing.map((m) => `<code>${esc(m)}</code>`).join(", ")}. Run the export command${S.live ? " for those namespaces" : " below"}, then reload${S.live && S.mode === "helmfile" && !S.release ? `, or <span class="link" data-action="cmp-ns-live">compare only the exported namespaces</span>` : ""}.</div>` : ""}
       ${S.livePaste ? `<div class="cmp-paste"><textarea id="live-text" spellcheck="false" placeholder="paste oc get … -o yaml output"></textarea><button class="btn sm primary" data-action="live-use">Compare</button></div>` : ""}
       ${S.live && S.live.error ? `<div class="errbar">Some of the export did not parse: ${esc(S.live.error)}</div>` : ""}`;
     if (!S.live) {
+      if (auto && A.loading) return `<div class="cmp">${loader}</div>`;
       return `<div class="cmp">${loader}${cmdBox(true)}
         <div class="empty"><h2>Compare with the cluster</h2>
         <p>Run the export command against the cluster, then load the file. Each rendered object is matched on kind, namespace and name.
@@ -1089,7 +1131,7 @@
     const nLiveNs = new Set(S.live.docs.map((d) => d.namespace).filter(Boolean));
     const nsMiss = r.namespaces.filter((n) => !nLiveNs.has(n));
     const inInv = S.mode === "helmfile" && !S.release;
-    const warn = nsMiss.length ? `<div class="note warn">The export has nothing in ${nsMiss.map((n) => `<code>${esc(n)}</code>`).join(", ")}. Everything there shows as missing; export ${nsMiss.length === 1 ? "that namespace" : "those namespaces"} too${inInv ? ` or <span class="link" data-action="cmp-ns-live">compare only the exported namespaces</span>` : ""}.</div>` : "";
+    const warn = nsMiss.length && !(auto && A.missing && A.missing.length) ? `<div class="note warn">The export has nothing in ${nsMiss.map((n) => `<code>${esc(n)}</code>`).join(", ")}. Everything there shows as missing; export ${nsMiss.length === 1 ? "that namespace" : "those namespaces"} too${inInv ? ` or <span class="link" data-action="cmp-ns-live">compare only the exported namespaces</span>` : ""}.</div>` : "";
     const row = (i) => {
       const real = i.diffs.filter((d) => !d.note);
       const notes = i.diffs.length - real.length;
@@ -1119,7 +1161,7 @@
       <div class="cmp-list">${shown.length ? shown.map(row).join("") : `<div class="empty">${all.length ? "Nothing matches the filter." : "No objects to compare."}</div>`}</div>
       ${r.skipped.length ? `<details class="cmp-skip"><summary class="muted small">${plural(r.skipped.length, "live object")} left out as cluster-made</summary>
         <div class="muted small mono">${r.skipped.map((x) => `${esc(x.kind)}/${esc(x.name)} <span>(${esc(x.why)})</span>`).join("<br>")}</div></details>` : ""}
-      ${cmdBox(false)}</div>`;
+      ${cmdBox(auto && A.missing && A.missing.length)}</div>`;
   }
 
   // ---- combined render: every release in the filter, merged ---------------------
@@ -1208,7 +1250,7 @@
     if (!R.length) return head + `<div class="empty">No releases match the filter.</div>`;
     if (!c.docs.length) return head + `<div class="empty">${c.pending.length ? "Rendering releases…" : "The releases rendered no manifests."}</div>`;
     const topo = HS.buildTopology(c.docs, "default", { nodes: S.dsNodes });
-    if (S.invTab === "compare") return head + (c.pending.length ? `<p class="muted small">${plural(c.pending.length, "release")} still rendering; the comparison fills in as they finish.</p>` : "") + compareHTML(c.docs, "default");
+    if (S.invTab === "compare") return head + (c.pending.length ? `<p class="muted small">${plural(c.pending.length, "release")} still rendering; the comparison fills in as they finish.</p>` : "") + compareHTML(c.docs, "default", HS.groupByNamespace(R).map((g) => g.ns).filter(Boolean));
     return head + (S.invTab === "map" ? mapHTML(topo, c.docs, "default", { quota: true }) : `<div class="comb-topo">${topologyHTML(topo)}</div>`);
   }
 

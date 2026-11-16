@@ -1316,27 +1316,48 @@
     return { items, extras, skipped, namespaces: [...namespaces].sort(), counts };
   }
 
+  // renderNamespaces lists the namespaces a set of rendered docs lands in.
+  function renderNamespaces(desired, defaultNs) {
+    return [...new Set(desired.filter((d) => d.obj && d.kind && !CLUSTER_SCOPED.has(d.kind)).map((d) => nsOfDoc(d, defaultNs)))].sort();
+  }
+
   // exportCommand writes the oc command that captures exactly the kinds and
-  // namespaces the render produced.
-  function exportCommand(desired, defaultNs, cli) {
+  // namespaces the render produced. out = { tpl, env } writes to the -live
+  // template's paths so helmscope picks the files up by itself.
+  function exportCommand(desired, defaultNs, cli, out) {
     cli = cli || "oc";
     const D = desired.filter((d) => d.obj && d.kind);
     const res = (d) => d.kind.toLowerCase() + (groupOf(d.apiVersion) ? "." + groupOf(d.apiVersion) : "");
     const nsKinds = [...new Set(D.filter((d) => !CLUSTER_SCOPED.has(d.kind)).map(res))].sort();
     const clKinds = [...new Set(D.filter((d) => CLUSTER_SCOPED.has(d.kind)).map(res))].sort();
-    const nss = [...new Set(D.filter((d) => !CLUSTER_SCOPED.has(d.kind)).map((d) => nsOfDoc(d, defaultNs)))].sort();
+    const nss = renderNamespaces(D, defaultNs);
+    const get = (ns) => `${cli} get ${nsKinds.join(",")} -n ${ns} -o yaml`;
     const lines = [];
-    if (nsKinds.length && nss.length === 1) lines.push(`${cli} get ${nsKinds.join(",")} -n ${nss[0]} -o yaml > live-${nss[0]}.yaml`);
-    else if (nsKinds.length) lines.push(`for ns in ${nss.join(" ")}; do ${cli} get ${nsKinds.join(",")} -n "$ns" -o yaml; echo ---; done > live.yaml`);
+    let tpl = out && out.tpl ? String(out.tpl).replace(/\{env\}/g, out.env || "{env}").replace(/^~(?=\/|$)/, "$HOME") : "";
+    if (tpl && !tpl.includes("{ns}") && !/\.(ya?ml|json)$/i.test(tpl) && !/[*?[]/.test(tpl)) tpl = tpl.replace(/\/+$/, "") + "/live.yaml";
+    if (tpl && /[*?[]/.test(tpl)) tpl = ""; // a glob names no single file to write
+    const q = (p) => `"${p.replace(/"/g, '\\"')}"`;
+    if (nsKinds.length) {
+      if (tpl && tpl.includes("{ns}")) {
+        const f = tpl.replace(/\{ns\}/g, "$ns");
+        lines.push(`for ns in ${nss.join(" ")}; do f=${q(f)}; mkdir -p "$(dirname "$f")"; ${get('"$ns"')} > "$f"; done`);
+      } else {
+        const file = tpl || (nss.length === 1 ? `live-${nss[0]}.yaml` : "live.yaml");
+        const pre = tpl ? `mkdir -p "$(dirname ${q(file)})"; ` : "";
+        if (nss.length === 1) lines.push(`${pre}${get(nss[0])} > ${tpl ? q(file) : file}`);
+        else lines.push(`${pre}for ns in ${nss.join(" ")}; do ${get('"$ns"')}; echo ---; done > ${tpl ? q(file) : file}`);
+      }
+    }
     if (clKinds.length) {
       const names = [...new Set(D.filter((d) => CLUSTER_SCOPED.has(d.kind)).map((d) => `${res(d)}/${d.name}`))].sort();
-      lines.push(`${cli} get ${names.join(" ")} -o yaml > live-cluster.yaml`);
+      const dir = tpl ? tpl.replace(/\/[^/]*$/, "").replace(/\{ns\}.*$/, "").replace(/\/+$/, "") : "";
+      lines.push(`${cli} get ${names.join(" ")} -o yaml > ${dir ? q(dir + "/live-cluster.yaml") : "live-cluster.yaml"}`);
     }
     return lines.join("\n");
   }
 
   return {
-    parseLive, diffObject, compareSets, exportCommand,
+    parseLive, diffObject, compareSets, exportCommand, renderNamespaces,
     splitManifest, fold, dump, podSpecOf,
     parseQty, fmtCpu, fmtBytes, fmtRes, podRes, buildMap, buildTopology,
     suggestQuota, describe, categoryOf, CATEGORIES,

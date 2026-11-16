@@ -43,6 +43,32 @@ Point it at a folder of charts or helmfiles and it shows:
   The tab shows the exact `oc get` command for the kinds and namespaces the
   render produces.
 
+### Compare sources
+
+Load an export by hand (**Load export…**, drag and drop, or **Paste**), or
+point helmscope at where exports live and it loads them by itself, the way
+sops finds its key through `SOPS_AGE_KEY_FILE`:
+
+```bash
+export HELMSCOPE_LIVE='~/exports/{env}/{ns}.yaml'    # or -live '...'
+./bin/helmscope ~/repos/app-deploy
+```
+
+- `{env}` is the environment picked in Helmfile mode (chart mode uses the same
+  one); `{ns}` is each namespace the render lands in. One template can serve
+  every environment and namespace.
+- A folder (`~/exports/{env}/`) loads every `*.yaml`, `*.yml` and `*.json` in
+  it; a glob (`~/exports/{env}/*-live.yaml`) loads every match.
+- With a template set, the export command on the Compare tab writes straight
+  to those paths, so the loop is: copy the command, run it where you have
+  cluster access, click **reload**. Files that aren't there yet are listed.
+- Loading a file by hand overrides the template until you click
+  **use -live files**.
+- The template is fixed when helmscope starts; the browser only sends the
+  environment and namespace names, which must be plain names. The files may
+  sit outside the scan root, which is where they belong: they hold Secret
+  data and should not go into the chart repo.
+
 It never talks to a cluster. It runs your own `helm` and `helmfile` binaries,
 so the output is exactly what they produce. Compare works on a file you
 export yourself.
@@ -67,6 +93,7 @@ Or grab a prebuilt release from GitHub Releases or Nexus
 | `-kube-version` | helm's default (`$HELMSCOPE_KUBE_VERSION`) | Default `--kube-version` for `.Capabilities`, e.g. `1.30.0` for OCP 4.17 |
 | `-timeout` | `90s` | Per helm/helmfile call |
 | `-cache` | user cache dir | Where `helmfile fetch` puts remote charts |
+| `-live` | none (`$HELMSCOPE_LIVE`) | Exported cluster snapshots for Compare: a file, folder or glob with `{env}` and `{ns}` placeholders, e.g. `~/exports/{env}/{ns}.yaml` |
 
 `helm` and `helmfile` inherit your environment, so `HELM_REPOSITORY_CONFIG`,
 `HELM_REGISTRY_CONFIG`, and Nexus credentials work as they do in your shell.
@@ -126,9 +153,10 @@ The exact command line is shown in the toolbar and the Log tab.
   HPA, `apiVersion`, and DeploymentConfig images set by image triggers are
   shown as notes, not drift. Extras skip objects with an owner, namespace
   defaults (`default`/`builder`/`deployer` SAs, `kube-root-ca.crt`), service
-  account secrets and Helm release records. The export stays in the browser
-  tab's memory: it is never sent to the server or stored, and it may hold
-  Secret data, so treat the file accordingly.
+  account secrets and Helm release records. A hand-loaded export stays in the
+  browser tab's memory and is never sent to the server or stored. `-live`
+  files are read from disk on each load or reload and never cached. Either way
+  they may hold Secret data, so treat the files accordingly.
 - **Secrets from `helm-secrets`/sops** are whatever helmfile renders. Use it on
   environments where that's acceptable, or render without the secrets layer.
 
