@@ -54,11 +54,15 @@ Write-Host "version:    $v"
 $port = Get-Random -Minimum 20000 -Maximum 40000
 $p = Start-Process -FilePath $exe -ArgumentList @('-addr', "127.0.0.1:$port", $out) -PassThru -WindowStyle Hidden
 try {
+  # the API only answers calls that carry a session token, like the web UI does
+  $headers = @{ 'X-Helmscope-Session' = 'verify-' + [guid]::NewGuid().ToString('N') }
   $info = $null
+  $lastErr = ''
   foreach ($i in 1..20) {
-    try { $info = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/info" -TimeoutSec 2; break } catch { Start-Sleep -Milliseconds 500 }
+    try { $info = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/info" -Headers $headers -TimeoutSec 2; break }
+    catch { $lastErr = $_.Exception.Message; Start-Sleep -Milliseconds 500 }
   }
-  if (-not $info) { throw 'server did not answer /api/info' }
+  if (-not $info) { throw "server did not answer /api/info: $lastErr" }
   Write-Host "api/info:   version=$($info.version) root=$($info.root)"
 } finally {
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

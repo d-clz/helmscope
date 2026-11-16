@@ -121,8 +121,14 @@ jobs:
             codesign -dv "$bin" 2>&1 | head -3 || true
           fi
           "$bin" -addr 127.0.0.1:18088 . & pid=$!
-          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18088/api/info && break; sleep 0.5; done
+          ok=""
+          for _ in $(seq 1 20); do
+            # the API only answers calls carrying a session token, like the web UI
+            if curl -fsS -H "X-Helmscope-Session: ci-verify-run-$GITHUB_RUN_ID" http://127.0.0.1:18088/api/info; then ok=1; break; fi
+            sleep 0.5
+          done
           kill $pid
+          [ -n "$ok" ] || { echo "::error::server did not answer /api/info"; exit 1; }
       - name: Verify Windows exe (version info, signature, run, Defender scan)
         if: runner.os == 'Windows'
         shell: pwsh
