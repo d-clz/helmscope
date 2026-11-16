@@ -16,21 +16,26 @@ import (
 )
 
 type server struct {
-	cfg config
-	mu  sync.Mutex // serialises chart fetches into the cache
+	cfg      config
+	sessions *sessionStore
+	mu       sync.Mutex // serialises chart fetches into the cache
 }
 
-func newServer(cfg config) *server { return &server{cfg: cfg} }
+func newServer(cfg config) *server { return &server{cfg: cfg, sessions: newSessionStore()} }
 
 func (s *server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/info", s.handleInfo)
-	mux.HandleFunc("GET /api/charts", s.handleCharts)
-	mux.HandleFunc("GET /api/chart/files", s.handleChartFiles)
-	mux.HandleFunc("POST /api/render", s.handleRender)
-	mux.HandleFunc("GET /api/helmfiles", s.handleHelmfiles)
-	mux.HandleFunc("POST /api/helmfile/build", s.handleHelmfileBuild)
-	mux.HandleFunc("POST /api/helmfile/template", s.handleHelmfileTemplate)
-	mux.HandleFunc("POST /api/helmfile/chart", s.handleHelmfileChart)
+	mux.HandleFunc("GET /api/info", s.api(s.handleInfo))
+	mux.HandleFunc("GET /api/charts", s.api(s.handleCharts))
+	mux.HandleFunc("GET /api/chart/files", s.api(s.handleChartFiles))
+	mux.HandleFunc("POST /api/render", s.api(s.handleRender))
+	mux.HandleFunc("GET /api/helmfiles", s.api(s.handleHelmfiles))
+	mux.HandleFunc("POST /api/helmfile/build", s.api(s.handleHelmfileBuild))
+	mux.HandleFunc("POST /api/helmfile/template", s.api(s.handleHelmfileTemplate))
+	mux.HandleFunc("POST /api/helmfile/chart", s.api(s.handleHelmfileChart))
+	mux.HandleFunc("GET /api/session", s.api(s.handleSessionGet))
+	mux.HandleFunc("PUT /api/session/sops", s.api(s.handleSessionSetKey))
+	mux.HandleFunc("DELETE /api/session/sops", s.api(s.handleSessionForgetKey))
+	mux.HandleFunc("POST /api/session/forget", s.handleSessionBeacon)
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -111,7 +116,7 @@ func (s *server) run(ctx context.Context, dir, bin string, args ...string) runRe
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	cmd.Env = s.childEnv(ctx)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	start := time.Now()

@@ -23,6 +23,8 @@
     res: null, docs: [], notes: [], errors: [],
     layers: [],
     tab: "manifests",
+    sops: { hasKey: false, publicKeys: [], envKeys: false },
+    sopsWanted: [],
     dsNodes: store.get("dsNodes", 3),
     headroom: store.get("headroom", 20),
     hideCats: store.get("hideCats", []),
@@ -45,8 +47,24 @@
     form: { release: "demo", namespace: "default", kubeVersion: "" },
   };
 
-  async function api(path, body) {
-    const r = await fetch("api/" + path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  // One random token per page load. A SOPS key set in this tab is held by the
+  // server under this token only, so a refresh (new token) means a new key.
+  const SESSION = (() => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "tab-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  })();
+
+  async function api(path, body, method) {
+    const opt = { headers: { "X-Helmscope-Session": SESSION } };
+    if (body !== undefined || method) {
+      opt.method = method || "POST";
+      if (body !== undefined) {
+        opt.headers["Content-Type"] = "application/json";
+        opt.body = JSON.stringify(body);
+      }
+    }
+    const r = await fetch("api/" + path, opt);
     const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
     if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
     return j;
@@ -61,10 +79,16 @@
     document.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); rerender(); }
     });
+    // closing or refreshing the tab drops its SOPS key on the server
+    window.addEventListener("pagehide", () => {
+      try { navigator.sendBeacon("api/session/forget", new Blob([SESSION], { type: "text/plain" })); } catch (e) { /* best effort */ }
+    });
+    document.body.insertAdjacentHTML("beforeend", `<dialog id="sops-dlg" class="dlg"></dialog>`);
     try {
       S.info = await api("info");
       S.form.kubeVersion = S.info.kubeVersion || "";
     } catch (e) { S.info = { root: "?", helm: e.message }; }
+    try { S.sops = await api("session"); } catch (e) { /* keep defaults */ }
     drawTop();
     await Promise.all([loadCharts(), loadHelmfiles()]);
     setMode(S.mode);
@@ -75,7 +99,82 @@
     $("#root").textContent = i.root || "";
     $("#tools").innerHTML =
       `<span class="pill ${i.helmOK ? "" : "bad"}" title="helm">${esc(i.helmOK ? i.helm : "helm not found")}</span>` +
-      `<span class="pill ${i.helmfileOK ? "" : "bad"}" title="helmfile">${esc(i.helmfileOK ? (i.helmfile || "").replace(/^helmfile version /, "helmfile ") : "helmfile not found")}</span>`;
+      `<span class="pill ${i.helmfileOK ? "" : "bad"}" title="helmfile">${esc(i.helmfileOK ? (i.helmfile || "").replace(/^helmfile version /, "helmfile ") : "helmfile not found")}</span>` +
+      `<button class="pill keybtn ${S.sops.hasKey ? "on" : ""}" data-action="sops-open" title="SOPS age key for helm secrets, kept for this tab only">🔑 ${S.sops.hasKey ? esc(S.sops.publicKeys.map(shortKey).join(", ")) : "SOPS key"}</button>`;
+  }
+
+  // ---- SOPS key (per tab, memory only) -----------------------------------------
+
+  const shortKey = (k) => (k.length > 20 ? `${k.slice(0, 10)}…${k.slice(-6)}` : k);
+  const SOPS_FAIL = /Failed to get the data key required to decrypt the SOPS file|no identity matched any of the recipients|Error while decrypting file/i;
+  const AGE_RECIPIENT = /age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}/g;
+
+  // sopsHint explains a decryption failure in render output, or returns "".
+  function sopsHint(text) {
+    if (!text || !SOPS_FAIL.test(text)) return "";
+    const wanted = [...new Set(String(text).match(AGE_RECIPIENT) || [])];
+    S.sopsWanted = wanted;
+    const mine = S.sops.publicKeys || [];
+    const matched = wanted.some((w) => mine.includes(w));
+    const msg = !mine.length
+      ? `No SOPS key is set for this tab${S.sops.envKeys ? ", and the one helmscope was started with didn't work" : ""}.`
+      : !matched && wanted.length
+        ? `Your key (${mine.map(shortKey).join(", ")}) isn't one the file is encrypted to.`
+        : "Your key is a recipient but decryption still failed; see the Log tab.";
+    return `<div class="hint">🔑 <b>SOPS couldn't decrypt a secrets file.</b> ${esc(msg)}${wanted.length ? ` Encrypted to: ${wanted.map((w) => `<code title="${esc(w)}">${esc(shortKey(w))}</code>`).join(", ")}.` : ""}
+      <button class="btn sm" data-action="sops-open">Set SOPS key</button></div>`;
+  }
+
+  function openSops() {
+    const d = $("#sops-dlg");
+    const k = S.sops;
+    d.innerHTML = `<h3>SOPS age key</h3>
+      <p class="muted small">Used when helm secrets / sops decrypt values files during a render. It stays in helmscope's memory for <b>this browser tab only</b>: refresh or close the tab and it's forgotten. It's never written to disk or sent back to the page, and an idle tab's key expires after 8 hours.</p>
+      ${k.hasKey ? `<div class="dlg-cur"><span class="muted small">In use:</span> ${k.publicKeys.map((p) => `<code title="${esc(p)}">${esc(p)}</code>`).join(" ")}
+        <button class="btn sm" data-action="sops-forget">Forget</button></div>` : ""}
+      ${S.sopsWanted.length ? `<p class="small">The last failed file is encrypted to: ${S.sopsWanted.map((w) => `<code>${esc(w)}</code>`).join(", ")}</p>` : ""}
+      ${k.envKeys ? `<p class="muted small">helmscope was also started with SOPS_AGE_KEY / SOPS_AGE_KEY_FILE set. A key added here is used alongside it.</p>` : ""}
+      <label class="small muted" for="sops-key">Paste an AGE-SECRET-KEY-1… line, or a whole keys.txt</label>
+      <textarea id="sops-key" class="secret" rows="4" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+      <div class="dlg-err" id="sops-err"></div>
+      <div class="dlg-row"><label class="btn">Load keys.txt…<input type="file" id="sops-file" hidden></label>
+        <span class="grow"></span><button class="btn" data-action="sops-close">Cancel</button>
+        <button class="btn primary" data-action="sops-apply">Use for this tab</button></div>`;
+    d.showModal();
+    $("#sops-key").focus();
+  }
+
+  async function applySops(text) {
+    const err = $("#sops-err");
+    if (!text.trim()) { err.textContent = "Paste a key or load a keys.txt first."; return; }
+    try {
+      S.sops = await api("session/sops", { keys: text }, "PUT");
+    } catch (e) {
+      err.textContent = e.message;
+      return;
+    } finally {
+      const ta = $("#sops-key");
+      if (ta) ta.value = "";
+    }
+    $("#sops-dlg").close();
+    afterKeyChange();
+  }
+
+  async function forgetSops() {
+    try { S.sops = await api("session/sops", undefined, "DELETE"); } catch (e) { /* ignore */ }
+    $("#sops-dlg").close();
+    afterKeyChange();
+  }
+
+  // afterKeyChange drops cached renders (they were made with the old key) and
+  // redoes whatever is on screen.
+  function afterKeyChange() {
+    drawTop();
+    S.relCache = new Map();
+    if (S.mode === "chart") return S.chart && rerender(true);
+    if (S.release) return renderRelease(false, true);
+    if (S.hf && !S.hf.res.ok) return hfLoad();
+    drawMain();
   }
 
   async function loadCharts() { try { S.charts = await api("charts"); } catch (e) { S.charts = []; } }
@@ -146,7 +245,7 @@
         <p>${S.mode === "chart"
           ? "Edit values on the left, read the rendered manifests, click any line to see which template produced it."
           : "helmfile build --embed-values gives the release inventory; pick a release to render it."}</p>
-        ${S.hf && S.hf.error ? `<div class="errbar" style="text-align:left">${esc(S.hf.error)}</div>` : ""}</div>`;
+        ${S.hf && S.hf.error ? `<div style="text-align:left">${sopsHint(S.hf.res.stderr)}<div class="errbar">${esc(S.hf.error)}</div></div>` : ""}</div>`;
       return;
     }
     el.innerHTML = toolbarHTML() + `<div class="work ${S.src ? "" : "nosrc"}">
@@ -213,8 +312,9 @@
       ["output", "Output", ""],
       ["log", "Log", S.errors.length || ""],
     ];
-    const errs = S.errors.length ? `<div class="errbar">${S.errors.map((e) => `<div>${e.file && (e.line || e.renderedLine) ? `<span class="link" data-action="open-src" data-file="${esc(e.file)}" data-line="${e.line}">${esc(e.file)}${e.line ? ":" + e.line : ""}</span> ` : ""}${esc(e.msg)}</div>`).join("")}</div>`
-      : S.res && !S.res.ok ? `<div class="errbar">${esc(lastLines(S.res.stderr, 6))}</div>` : "";
+    const hint = sopsHint(S.res && S.res.stderr);
+    const errs = hint + (S.errors.length ? `<div class="errbar">${S.errors.map((e) => `<div>${e.file && (e.line || e.renderedLine) ? `<span class="link" data-action="open-src" data-file="${esc(e.file)}" data-line="${e.line}">${esc(e.file)}${e.line ? ":" + e.line : ""}</span> ` : ""}${esc(e.msg)}</div>`).join("")}</div>`
+      : S.res && !S.res.ok ? `<div class="errbar">${esc(lastLines(S.res.stderr, 6))}</div>` : "");
     let ctl = "";
     if (S.tab === "manifests") ctl = `<input id="doc-filter" placeholder="filter kind/name" value="${esc(S.docFilter)}" style="width:150px"><label class="ctl"><input type="checkbox" id="fold" ${S.fold ? "checked" : ""}> fold labels</label>`;
     if (S.tab === "values") ctl = `<input id="val-filter" placeholder="filter key" value="${esc(S.valFilter)}" style="width:140px">
@@ -627,6 +727,10 @@
     const a = t.dataset.action;
     switch (a) {
       case "mode": return setMode(t.dataset.mode);
+      case "sops-open": return openSops();
+      case "sops-close": return $("#sops-dlg").close();
+      case "sops-apply": return applySops($("#sops-key").value);
+      case "sops-forget": return forgetSops();
       case "pick-chart": return pickChart(t.dataset.path);
       case "render": return rerender(true);
       case "tab": S.tab = t.dataset.tab; return drawMain();
@@ -726,6 +830,13 @@
         drawMain();
         const el = $("#inv-q");
         if (el) { el.focus(); el.setSelectionRange(v.length, v.length); }
+        return;
+      }
+      case "sops-file": {
+        const f = e.target.files && e.target.files[0];
+        if (!f) return;
+        f.text().then((txt) => applySops(txt));
+        e.target.value = "";
         return;
       }
       case "headroom": S.headroom = Math.max(0, parseInt(v, 10) || 0); store.set("headroom", S.headroom); return redrawKeepScroll();
@@ -939,7 +1050,7 @@
     const chips = groups.map((g) => `<button class="fchip ${S.nsHide.includes(g.ns) ? "" : "on"}" data-action="ns-toggle" data-ns="${esc(g.ns)}" title="Click to toggle · Shift+click to show only this namespace">${esc(nsLabel(g.ns))} <span class="muted">${g.releases.length}</span></button>`).join("");
     el.innerHTML = `<div class="toolbar"><div class="title">${esc(S.hfFile)}</div><span class="tag">env: ${esc(S.hfEnv)}</span>
         <span class="grow"></span><span class="status ${S.hf.res.ok ? "good" : "bad"}" title="${esc(S.hf.res.cmd || "")}">${S.hf.res.ok ? "✓" : "✗"} ${esc(S.hf.res.cmd || "")}</span></div>
-      ${S.hf.error ? `<div class="errbar">${esc(S.hf.error)}</div>` : ""}
+      ${S.hf.error ? `${sopsHint(S.hf.res.stderr)}<div class="errbar">${esc(S.hf.error)}</div>` : ""}
       <div class="inv">
         <div class="inv-bar">
           <input id="inv-q" placeholder="filter releases or charts" value="${esc(S.invQuery)}" style="width:200px">
@@ -1043,6 +1154,7 @@
     const head = `<div class="comb-h">
         ${S.combining ? `<span class="status"><span class="spin"></span> rendering ${S.combining.done}/${S.combining.total} releases…</span>` : `<span class="muted small">${plural(R.length - c.pending.length, "release")} · ${plural(nNs, "namespace")} · ${plural(c.docs.length, "manifest")}</span>`}
         <span class="grow"></span><button class="btn sm" data-action="comb-refresh" ${S.combining ? "disabled" : ""}>Re-render</button></div>
+      ${sopsHint(c.failed.map((f) => f.res.stderr).join("\n"))}
       ${c.failed.length ? `<div class="errbar">${c.failed.map((f) => `<div><span class="link" data-action="pick-release" data-id="${esc(f.r.id)}">${esc(f.r.id)}</span> failed to render: ${esc(lastLines(f.res.stderr, 2))}</div>`).join("")}</div>` : ""}
       ${skipped.length ? `<p class="muted small">Left out (installed: false): ${skipped.map((r) => esc(r.id)).join(", ")}</p>` : ""}`;
     if (!R.length) return head + `<div class="empty">No releases match the filter.</div>`;
