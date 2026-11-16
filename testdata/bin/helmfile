@@ -20,6 +20,17 @@ case "$cmd" in
     # name the objects after the release, like a real chart would
     rel="$(printf '%s' "$sel" | sed -n 's/.*name=\([^,]*\).*/\1/p')"
     echo "Templating release=${rel:-web}" >&2
+    # HELMSCOPE_TEST_SOPS=1: decrypt a secrets file like helm-secrets would,
+    # using whatever SOPS_AGE_KEY / SOPS_AGE_KEY_FILE the process inherited
+    if [[ "${HELMSCOPE_TEST_SOPS:-}" == 1 ]]; then
+      echo "Decrypting secret $here/secrets/secret.sops.yaml" >&2
+      if ! plain="$(sops -d "$here/secrets/secret.sops.yaml" 2>&1)"; then
+        printf '%s\n[helm-secrets] Error while decrypting file: %s\n' "$plain" "$here/secrets/secret.sops.yaml" >&2
+        exit 1
+      fi
+      pw="$(printf '%s\n' "$plain" | sed -n 's/^ *password: *//p')"
+      printf -- '---\n# Source: web/templates/secret.yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: %s-db\nstringData:\n  password: %s\n' "${rel:-demo}" "$pw"
+    fi
     sed "s/demo-/${rel:-demo}-/g" "$here/rendered.yaml" ;;
   fetch) mkdir -p "$out/redis-shared/redis/18.1.0"; cp -r "$here/charts/web/charts/redis" "$out/redis-shared/redis/18.1.0/" ;;
   *) echo "fake helmfile: unsupported" >&2; exit 2 ;;

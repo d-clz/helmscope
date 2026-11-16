@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+const testToken = "test-session-0000000001"
+
 func testServer(t *testing.T) (*server, *http.ServeMux) {
 	t.Helper()
 	root, _ := filepath.Abs("testdata")
@@ -42,6 +44,7 @@ func call(t *testing.T, mux *http.ServeMux, method, path string, body any, out a
 		rd = bytes.NewReader(nil)
 	}
 	req := httptest.NewRequest(method, path, rd)
+	req.Header.Set(sessionHeader, testToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if out != nil {
