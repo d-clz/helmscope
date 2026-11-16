@@ -245,3 +245,65 @@ func TestEnvScanIgnoresLaterBlocks(t *testing.T) {
 		t.Errorf("envs = %q", got)
 	}
 }
+
+func TestLive(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(dir, rel)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("uat/apps.yaml", "kind: List\nitems: []\n")
+	write("uat/platform.yaml", "kind: Service\n")
+	write("uat/notes.txt", "ignored\n")
+	write("prod/all/a.yaml", "a: 1\n")
+	write("prod/all/b.json", "{}\n")
+
+	s, mux := testServer(t)
+	var e apiError
+	if code := call(t, mux, "POST", "/api/live", map[string]any{"env": "uat"}, &e); code != 404 {
+		t.Fatalf("unconfigured: %d", code)
+	}
+
+	s.cfg.Live = filepath.Join(dir, "{env}", "{ns}.yaml")
+	var r liveResult
+	if code := call(t, mux, "POST", "/api/live", map[string]any{"env": "uat", "namespaces": []string{"apps", "platform", "gone", "apps", ""}}, &r); code != 200 {
+		t.Fatalf("per-ns: %d", code)
+	}
+	if len(r.Files) != 2 || len(r.Missing) != 1 || !strings.HasSuffix(r.Missing[0], filepath.Join("uat", "gone.yaml")) {
+		t.Fatalf("per-ns: %+v", r)
+	}
+	if r.Text != "kind: List\nitems: []\n\n---\nkind: Service\n" {
+		t.Fatalf("text: %q", r.Text)
+	}
+
+	// folder: every yaml/json, nothing else
+	s.cfg.Live = filepath.Join(dir, "{env}", "all")
+	r = liveResult{}
+	call(t, mux, "POST", "/api/live", map[string]any{"env": "prod"}, &r)
+	if len(r.Files) != 2 || len(r.Missing) != 0 {
+		t.Fatalf("dir: %+v", r)
+	}
+
+	// glob
+	s.cfg.Live = filepath.Join(dir, "uat", "*.yaml")
+	r = liveResult{}
+	call(t, mux, "POST", "/api/live", map[string]any{}, &r)
+	if len(r.Files) != 2 {
+		t.Fatalf("glob: %+v", r)
+	}
+
+	// names from the browser can't walk out of the template
+	s.cfg.Live = filepath.Join(dir, "{env}", "{ns}.yaml")
+	for _, body := range []map[string]any{
+		{"env": "..", "namespaces": []string{"apps"}},
+		{"env": "uat", "namespaces": []string{"../prod/all/a"}},
+		{"env": "", "namespaces": []string{"apps"}},
+	} {
+		if code := call(t, mux, "POST", "/api/live", body, &e); code != 400 {
+			t.Fatalf("%v: want 400, got %d", body, code)
+		}
+	}
+}

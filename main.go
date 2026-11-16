@@ -32,6 +32,7 @@ type config struct {
 	KubeVersion string
 	Timeout     time.Duration
 	CacheDir    string
+	Live        string // path template for exported cluster snapshots, see live.go
 }
 
 func main() {
@@ -48,6 +49,7 @@ func main() {
 	flag.StringVar(&cfg.KubeVersion, "kube-version", envOr("HELMSCOPE_KUBE_VERSION", ""), "default --kube-version for .Capabilities (e.g. 1.30.0)")
 	flag.DurationVar(&cfg.Timeout, "timeout", 90*time.Second, "timeout for each helm/helmfile call")
 	flag.StringVar(&cfg.CacheDir, "cache", defCache, "cache dir for fetched remote charts")
+	flag.StringVar(&cfg.Live, "live", envOr("HELMSCOPE_LIVE", ""), "exported cluster snapshots for Compare: file, folder or glob; {env} and {ns} are filled in (e.g. ~/exports/{env}/{ns}.yaml)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -89,6 +91,9 @@ func main() {
 
 	log.Printf("helmscope %s", version)
 	log.Printf("root:  %s", cfg.Root)
+	if cfg.Live != "" {
+		log.Printf("live:  %s", cfg.Live)
+	}
 	log.Printf("open:  http://%s", displayAddr(cfg.Addr))
 	hs := &http.Server{
 		Addr:              cfg.Addr,

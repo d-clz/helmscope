@@ -32,6 +32,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/helmfile/build", s.api(s.handleHelmfileBuild))
 	mux.HandleFunc("POST /api/helmfile/template", s.api(s.handleHelmfileTemplate))
 	mux.HandleFunc("POST /api/helmfile/chart", s.api(s.handleHelmfileChart))
+	mux.HandleFunc("POST /api/live", s.api(s.handleLive))
 	mux.HandleFunc("GET /api/session", s.api(s.handleSessionGet))
 	mux.HandleFunc("PUT /api/session/sops", s.api(s.handleSessionSetKey))
 	mux.HandleFunc("DELETE /api/session/sops", s.api(s.handleSessionForgetKey))
@@ -162,6 +163,7 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"helmOK":      hv.OK,
 		"helmfile":    strings.TrimSpace(firstNonEmpty(hfv.Stdout, hfv.Stderr)),
 		"helmfileOK":  hfv.OK,
+		"live":        s.cfg.Live,
 	})
 }
 
