@@ -24,15 +24,6 @@ type server struct {
 func newServer(cfg config) *server { return &server{cfg: cfg, sessions: newSessionStore()} }
 
 func (s *server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/info", s.handleInfo)
-	mux.HandleFunc("GET /api/charts", s.handleCharts)
-	mux.HandleFunc("GET /api/chart/files", s.handleChartFiles)
-	mux.HandleFunc("POST /api/render", s.handleRender)
-	mux.HandleFunc("GET /api/helmfiles", s.handleHelmfiles)
-	mux.HandleFunc("POST /api/helmfile/build", s.handleHelmfileBuild)
-	mux.HandleFunc("POST /api/helmfile/template", s.handleHelmfileTemplate)
-	mux.HandleFunc("POST /api/helmfile/chart", s.handleHelmfileChart)
-	mux.HandleFunc("POST /api/live", s.handleLive)
 	mux.HandleFunc("GET /api/info", s.api(s.handleInfo))
 	mux.HandleFunc("GET /api/charts", s.api(s.handleCharts))
 	mux.HandleFunc("GET /api/chart/files", s.api(s.handleChartFiles))
@@ -41,6 +32,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/helmfile/build", s.api(s.handleHelmfileBuild))
 	mux.HandleFunc("POST /api/helmfile/template", s.api(s.handleHelmfileTemplate))
 	mux.HandleFunc("POST /api/helmfile/chart", s.api(s.handleHelmfileChart))
+	mux.HandleFunc("POST /api/live", s.api(s.handleLive))
 	mux.HandleFunc("GET /api/session", s.api(s.handleSessionGet))
 	mux.HandleFunc("PUT /api/session/sops", s.api(s.handleSessionSetKey))
 	mux.HandleFunc("DELETE /api/session/sops", s.api(s.handleSessionForgetKey))
